@@ -42,7 +42,15 @@ struct EffectJob {
 
 enum Dialog {
     None,
-    Preferences { w: u32, h: u32, bg: u8, skin: Skin, keys: crate::tools::KeyBindings, attached: bool },
+    /// A newer release exists.
+    Update { rel: crate::update::Release },
+    /// Downloading and installing a release.
+    Updating { version: String },
+    /// Installed; offer a restart.
+    UpdateDone { version: String },
+    /// A plain message box.
+    Info { title: String, text: String },
+    Preferences { w: u32, h: u32, bg: u8, skin: Skin, keys: crate::tools::KeyBindings, attached: bool, check_updates: bool },
     /// Clipboard image: paste into the current image or open as a new one.
     PasteChoice { w: u32, h: u32, data: Arc<Vec<u8>>, fit: ops::PasteFit },
     /// Files dropped onto the window while an image is open.
@@ -80,6 +88,12 @@ pub struct App {
     win_colors: bool,
     color_target_primary: bool,
     error: Option<String>,
+    update_rx: Option<std::sync::mpsc::Receiver<crate::update::CheckResult>>,
+    /// The running check was started from the menu (report "up to date" too).
+    update_manual: bool,
+    install_rx: Option<std::sync::mpsc::Receiver<Result<PathBuf, String>>>,
+    /// Version the user chose to skip.
+    skip_version: String,
     start: Instant,
     drag: Option<bool>,
     middle_pan: Option<Pos2>,
@@ -147,6 +161,8 @@ struct Prefs {
     keys: crate::tools::KeyBindings,
     /// Paint.NET skins: pin Tools/Colors/Layers/History to the canvas corners.
     windows_attached: bool,
+    /// Look for a new release on startup.
+    check_updates: bool,
 }
 
 impl Prefs {
@@ -154,7 +170,7 @@ impl Prefs {
         std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config/patina/prefs"))
     }
     fn load() -> Prefs {
-        let mut p = Prefs { w: 800, h: 600, bg: 0, keys: Default::default(), windows_attached: false };
+        let mut p = Prefs { w: 800, h: 600, bg: 0, keys: Default::default(), windows_attached: false, check_updates: true };
         let text = Self::path().and_then(|f| std::fs::read_to_string(f).ok()).unwrap_or_default();
         for line in text.lines() {
             let Some((k, v)) = line.split_once('=') else { continue };
@@ -164,6 +180,7 @@ impl Prefs {
                 "canvas_height" => p.h = v.parse().unwrap_or(p.h).clamp(1, 100_000),
                 "canvas_background" => p.bg = v.parse().unwrap_or(p.bg).min(2),
                 "windows_attached" => p.windows_attached = v == "1" || v == "true",
+                "check_updates" => p.check_updates = v == "1" || v == "true",
                 k => {
                     for (id, _, slot) in p.keys.entries() {
                         if id == k {
@@ -180,7 +197,10 @@ impl Prefs {
     fn save(self) {
         if let Some(f) = Self::path() {
             let _ = std::fs::create_dir_all(f.parent().unwrap());
-            let mut text = format!("canvas_width={}\ncanvas_height={}\ncanvas_background={}\nwindows_attached={}\n", self.w, self.h, self.bg, self.windows_attached as u8);
+            let mut text = format!(
+                "canvas_width={}\ncanvas_height={}\ncanvas_background={}\nwindows_attached={}\ncheck_updates={}\n",
+                self.w, self.h, self.bg, self.windows_attached as u8, self.check_updates as u8
+            );
             let mut keys = self.keys;
             for (id, _, m) in keys.entries() {
                 text.push_str(&format!("{id}={}\n", m.id()));
@@ -272,6 +292,10 @@ impl App {
             dialog: Dialog::None,
             show_grid: false,
             prefs: Prefs::load(),
+            update_rx: None,
+            update_manual: false,
+            install_rx: None,
+            skip_version: String::new(),
             skin: Skin::load(),
             skin_applied: None,
             win_tools: true,
@@ -294,6 +318,10 @@ impl App {
             script: std::env::var("PINTA_SCRIPT").ok().and_then(|p| crate::script::Script::load(&p)),
         };
         app.tools.keys = app.prefs.keys;
+        app.skip_version = cc.storage.and_then(|st| st.get_string("skip_version")).unwrap_or_default();
+        if app.prefs.check_updates && app.script.is_none() {
+            app.update_rx = Some(crate::update::check_async());
+        }
         if let Some(w) = cc.storage.and_then(|st| st.get_string("classic_windows")) {
             let f: Vec<bool> = w.chars().map(|c| c == '1').collect();
             if f.len() == 4 {
@@ -572,6 +600,63 @@ impl App {
         self.tools.finish(doc);
         ops::paste(doc, w, h, data, at, target == 1, fit);
         self.tools.set_tool(None, ToolKind::MoveSelected);
+    }
+
+    /// Handle finished update checks and installs.
+    fn poll_updates(&mut self, ctx: &egui::Context) {
+        use crate::update::CheckResult;
+        if let Some(rx) = &self.update_rx {
+            ctx.request_repaint_after(std::time::Duration::from_millis(250));
+            if let Ok(r) = rx.try_recv() {
+                self.update_rx = None;
+                let manual = std::mem::take(&mut self.update_manual);
+                match r {
+                    CheckResult::Newer(rel) if manual || rel.version != self.skip_version => {
+                        if matches!(self.dialog, Dialog::None) || manual {
+                            self.dialog = Dialog::Update { rel };
+                        }
+                    }
+                    CheckResult::Newer(_) => {}
+                    CheckResult::UpToDate if manual => {
+                        self.dialog = Dialog::Info { title: "No Update".into(), text: format!("Patina {} is the newest version.", crate::update::current_version()) };
+                    }
+                    CheckResult::UpToDate => {}
+                    CheckResult::Failed(e) if manual => self.error = Some(format!("Could not check for updates: {e}")),
+                    CheckResult::Failed(e) => log::info!("update check failed: {e}"),
+                }
+            }
+        }
+        if let Some(rx) = &self.install_rx {
+            ctx.request_repaint_after(std::time::Duration::from_millis(100));
+            if let Ok(r) = rx.try_recv() {
+                self.install_rx = None;
+                let version = match &self.dialog {
+                    Dialog::Updating { version } => version.clone(),
+                    _ => String::new(),
+                };
+                match r {
+                    Ok(path) => {
+                        log::info!("updated {} to {version}", path.display());
+                        self.dialog = Dialog::UpdateDone { version };
+                    }
+                    Err(e) => {
+                        self.dialog = Dialog::None;
+                        self.error = Some(format!("Update failed: {e}"));
+                    }
+                }
+            }
+        }
+    }
+
+    /// Start the (updated) program again and close this one.
+    fn restart(&mut self) {
+        match crate::update::exe_path() {
+            Ok(exe) => match std::process::Command::new(exe).spawn() {
+                Ok(_) => self.quit_confirmed = true,
+                Err(e) => self.error = Some(format!("Could not restart: {e}")),
+            },
+            Err(e) => self.error = Some(format!("Could not restart: {e}")),
+        }
     }
 
     fn bg_color(&self, bg: u8) -> Option<[u8; 4]> {
@@ -1073,7 +1158,7 @@ impl App {
                 ui.separator();
                 if ui.button("Preferences...").clicked() {
                     let p = self.prefs;
-                    self.dialog = Dialog::Preferences { w: p.w, h: p.h, bg: p.bg, skin: self.skin, keys: p.keys, attached: p.windows_attached };
+                    self.dialog = Dialog::Preferences { w: p.w, h: p.h, bg: p.bg, skin: self.skin, keys: p.keys, attached: p.windows_attached, check_updates: p.check_updates };
                 }
             });
             ui.menu_button("View", |ui| {
@@ -1225,6 +1310,10 @@ impl App {
                 });
             }
             ui.menu_button("Help", |ui| {
+                if ui.add_enabled(self.update_rx.is_none(), egui::Button::new("Check for Updates...")).clicked() {
+                    self.update_manual = true;
+                    self.update_rx = Some(crate::update::check_async());
+                }
                 if ui.button("About").clicked() {
                     self.dialog = Dialog::About;
                 }
@@ -1973,7 +2062,77 @@ impl App {
         let mut act: Option<Box<dyn FnOnce(&mut App)>> = None;
         match &mut self.dialog {
             Dialog::None => {}
-            Dialog::Preferences { w, h, bg, skin, keys, attached } => {
+            Dialog::Update { rel } => {
+                let rel = rel.clone();
+                let cur = crate::update::current_version();
+                egui::Window::new("Update Available").collapsible(false).resizable(false).anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO).order(egui::Order::Foreground).show(ctx, |ui| {
+                    ui.label(format!("Patina {} is available. You have {cur}.", rel.version));
+                    ui.hyperlink_to("What's new", &rel.page);
+                    let auto = crate::update::can_self_update() && rel.asset.is_some();
+                    if !auto {
+                        ui.weak("Automatic updating is not available for this build; download it from the releases page.");
+                    }
+                    ui.add_space(4.0);
+                    ui.weak("Automatic update checks can be turned off in Edit > Preferences.");
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        if auto && ui.add(egui::Button::new("Update now").fill(ui.visuals().selection.bg_fill)).clicked() {
+                            let (url, v) = (rel.asset.clone().unwrap_or_default(), rel.version.clone());
+                            act = Some(Box::new(move |app: &mut App| {
+                                app.install_rx = Some(crate::update::install_async(url));
+                                app.dialog = Dialog::Updating { version: v };
+                            }));
+                        }
+                        if ui.button("Later").clicked() {
+                            close = true;
+                        }
+                        if ui.button("Skip this version").clicked() {
+                            let v = rel.version.clone();
+                            act = Some(Box::new(move |app: &mut App| app.skip_version = v));
+                            close = true;
+                        }
+                    });
+                });
+            }
+            Dialog::Updating { version } => {
+                let v = version.clone();
+                egui::Window::new("Updating").collapsible(false).resizable(false).anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO).order(egui::Order::Foreground).show(ctx, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label(format!("Downloading and installing Patina {v}..."));
+                    });
+                });
+            }
+            Dialog::UpdateDone { version } => {
+                let v = version.clone();
+                let dirty = self.docs.iter().any(|d| d.is_dirty());
+                egui::Window::new("Update Installed").collapsible(false).resizable(false).anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO).order(egui::Order::Foreground).show(ctx, |ui| {
+                    ui.label(format!("Patina {v} is installed. Restart to use it."));
+                    if dirty {
+                        ui.weak("Save your images first; restarting closes them.");
+                    }
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        if ui.add_enabled(!dirty, egui::Button::new("Restart now").fill(ui.visuals().selection.bg_fill)).clicked() {
+                            act = Some(Box::new(|app: &mut App| app.restart()));
+                            close = true;
+                        }
+                        if ui.button("Later").clicked() {
+                            close = true;
+                        }
+                    });
+                });
+            }
+            Dialog::Info { title, text } => {
+                let (t, x) = (title.clone(), text.clone());
+                egui::Window::new(t).collapsible(false).resizable(false).anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO).order(egui::Order::Foreground).show(ctx, |ui| {
+                    ui.label(x);
+                    if ui.button("OK").clicked() {
+                        close = true;
+                    }
+                });
+            }
+            Dialog::Preferences { w, h, bg, skin, keys, attached, check_updates } => {
                 egui::Window::new("Preferences").collapsible(false).resizable(false).anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO).order(egui::Order::Foreground).show(ctx, |ui| {
                     ui.strong("Appearance");
                     ui.horizontal(|ui| {
@@ -2030,12 +2189,15 @@ impl App {
                         *keys = Default::default();
                     }
                     ui.separator();
+                    ui.strong("Updates");
+                    ui.checkbox(check_updates, "Check for updates when Patina starts");
+                    ui.separator();
                     ui.horizontal(|ui| {
                         if ui.button("Cancel").clicked() {
                             close = true;
                         }
                         if ui.add(egui::Button::new("Save").fill(ui.visuals().selection.bg_fill)).clicked() {
-                            let p = Prefs { w: *w, h: *h, bg: *bg, keys: *keys, windows_attached: *attached };
+                            let p = Prefs { w: *w, h: *h, bg: *bg, keys: *keys, windows_attached: *attached, check_updates: *check_updates };
                             let sk = *skin;
                             act = Some(Box::new(move |app: &mut App| {
                                 app.prefs = p;
@@ -2753,6 +2915,7 @@ impl eframe::App for App {
     /// which Classic windows are open.
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
         let b = |v: bool| if v { '1' } else { '0' };
+        storage.set_string("skip_version", self.skip_version.clone());
         storage.set_string("classic_windows", [b(self.win_tools), b(self.win_history), b(self.win_layers), b(self.win_colors)].iter().collect());
     }
 
@@ -2775,6 +2938,7 @@ impl eframe::App for App {
         if self.quit_confirmed {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
+        self.poll_updates(&ctx);
         if ctx.input_mut(|i| i.consume_shortcut(&KeyboardShortcut::new(Modifiers::COMMAND, Key::Q))) {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }

@@ -17,6 +17,9 @@ install -Dm755 patina/patina ~/.local/bin/patina
 install -Dm644 patina/patina.desktop ~/.local/share/applications/patina.desktop
 ```
 
+Patina checks for new releases when it starts and asks before updating itself
+(Linux build; turn it off in Edit > Preferences, or use Help > Check for Updates).
+
 The newest development build of every commit is also available under the
 [Actions tab](https://github.com/Kurisu003/patina/actions) (open a run, then "Artifacts").
 

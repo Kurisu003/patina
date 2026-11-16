@@ -16,6 +16,7 @@ mod script;
 mod selftest;
 mod surface;
 mod text;
+mod update;
 mod tools;
 
 use eframe::egui;
