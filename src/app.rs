@@ -518,6 +518,34 @@ impl App {
         if typing || self.busy() {
             return;
         }
+        // egui-winit turns Ctrl+X/C/V into Cut/Copy/Paste events instead of
+        // key presses, so handle those (and swallow them) here.
+        let clip: Vec<u8> = ctx.input_mut(|i| {
+            let mut v = Vec::new();
+            i.events.retain(|e| match e {
+                egui::Event::Copy => {
+                    v.push(0);
+                    false
+                }
+                egui::Event::Cut => {
+                    v.push(1);
+                    false
+                }
+                egui::Event::Paste(_) | egui::Event::PasteImage(_) => {
+                    v.push(2);
+                    false
+                }
+                _ => true,
+            });
+            v
+        });
+        for c in clip {
+            match c {
+                0 => self.copy(false, false),
+                1 => self.copy(false, true),
+                _ => self.paste(0),
+            }
+        }
         if sc(cs, Key::Z) || sc(Modifiers::COMMAND, Key::Y) {
             if let Some(d) = self.doc() {
                 d.redo();
@@ -695,7 +723,7 @@ impl App {
         let mut keys = Vec::new();
         for e in events {
             match e {
-                egui::Event::Text(t) => keys.push(TextKey::Insert(t)),
+                egui::Event::Text(t) | egui::Event::Paste(t) => keys.push(TextKey::Insert(t)),
                 egui::Event::Key { key, pressed: true, modifiers, .. } => match key {
                     Key::Backspace => keys.push(TextKey::Backspace),
                     Key::Delete => keys.push(TextKey::Delete),
@@ -715,7 +743,7 @@ impl App {
         }
         // swallow everything so tool letters and Delete/Backspace shortcuts don't fire
         ctx.input_mut(|i| {
-            i.events.retain(|e| !matches!(e, egui::Event::Text(_) | egui::Event::Key { .. }));
+            i.events.retain(|e| !matches!(e, egui::Event::Text(_) | egui::Event::Key { .. } | egui::Event::Paste(_) | egui::Event::PasteImage(_) | egui::Event::Copy | egui::Event::Cut));
         });
         let tools = &mut self.tools;
         let pal = &self.palette;

@@ -5,7 +5,7 @@ edition = "2024"
 
 [dependencies]
 ab_glyph = "0.2"
-arboard = "3"
+arboard = { version = "3", features = ["wayland-data-control"] }
 eframe = { version = "0.37", default-features = false, features = ["wgpu", "default_fonts", "wayland", "x11"] }
 egui-wgpu = "0.37"
 image = "0.25"

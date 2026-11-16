@@ -142,6 +142,9 @@ impl Script {
                 });
                 self.wait = 5;
             }
+            "copy" => raw.events.push(Event::Copy),
+            "cut" => raw.events.push(Event::Cut),
+            "paste" => raw.events.push(Event::Paste(String::new())),
             "log" => println!("script: {rest}"),
             "quit" => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
             _ => println!("script: unknown command {line}"),
