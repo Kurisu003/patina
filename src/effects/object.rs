@@ -416,6 +416,11 @@ pub struct OutlineObject {
     pub color_gradient: bool,
     pub outline_border: bool,
     pub fill_object_background: bool,
+    /// Use the custom colours below instead of the palette's primary/secondary.
+    pub custom_colors: bool,
+    /// Straight RGBA: outline colour and the colour the gradient fades to.
+    pub color: [u8; 4],
+    pub gradient_color: [u8; 4],
     dist: Option<EdgeDistance>,
 }
 
@@ -428,6 +433,9 @@ impl Default for OutlineObject {
             color_gradient: true,
             outline_border: false,
             fill_object_background: true,
+            custom_colors: false,
+            color: [0, 0, 0, 255],
+            gradient_color: [255, 255, 255, 255],
             dist: None,
         }
     }
@@ -484,6 +492,22 @@ impl Effect for OutlineObject {
         c |= ui.checkbox(&mut self.color_gradient, "Color Gradient").changed();
         c |= ui.checkbox(&mut self.outline_border, "Outline Border").changed();
         c |= ui.checkbox(&mut self.fill_object_background, "Fill Object Background").changed();
+        ui.separator();
+        ui.horizontal(|ui| {
+            ui.label("Colors:");
+            c |= ui.radio_value(&mut self.custom_colors, false, "Palette").on_hover_text("Primary color, fading to the secondary color").changed();
+            c |= ui.radio_value(&mut self.custom_colors, true, "Custom").changed();
+        });
+        if self.custom_colors {
+            ui.horizontal(|ui| {
+                ui.label("Outline color");
+                c |= ui.color_edit_button_srgba_unmultiplied(&mut self.color).changed();
+                if self.color_gradient {
+                    ui.label("fades to");
+                    c |= ui.color_edit_button_srgba_unmultiplied(&mut self.gradient_color).changed();
+                }
+            });
+        }
         c
     }
     fn prepare(&mut self, src: &Surface, ctx: &RenderCtx) {
@@ -496,8 +520,9 @@ impl Effect for OutlineObject {
         let radius = self.effective_radius();
         let rf = radius as f32;
         let r2 = (radius * radius) as u32;
-        let primary = to_premul(ctx.primary);
-        let secondary = to_premul(ctx.secondary);
+        let (c1, c2) = if self.custom_colors { (self.color, self.gradient_color) } else { (ctx.primary, ctx.secondary) };
+        let primary = to_premul(c1);
+        let secondary = to_premul(c2);
         for y in 0..r.h {
             for x in 0..r.w {
                 let o = ((y * r.w + x) * 4) as usize;
@@ -744,7 +769,7 @@ mod tests {
             return;
         }
         let oo = |radius, tolerance, alpha_gradient, color_gradient, outline_border, fill_object_background| -> Box<dyn Effect> {
-            Box::new(OutlineObject { radius, tolerance, alpha_gradient, color_gradient, outline_border, fill_object_background, dist: None })
+            Box::new(OutlineObject { radius, tolerance, alpha_gradient, color_gradient, outline_border, fill_object_background, ..Default::default() })
         };
         // Pinta bugs we deliberately fix, so these only report differences:
         // GetObjectBounds/AlignObject treat the inclusive Right/Bottom as
