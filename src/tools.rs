@@ -492,8 +492,95 @@ struct MoveSelectedState {
     start: [f32; 2],
     offset: [f32; 2],
     angle: f32,
-    rotating: bool,
+    /// Signed scale factors (negative = flipped).
+    scale: [f32; 2],
+    mode: MsMode,
     rot_start: f32,
+}
+
+#[derive(Clone, Copy)]
+enum MsMode {
+    Move,
+    Rotate,
+    /// Dragging a grab handle; `anchor` (opposite handle, image coords) stays put.
+    Handle { hx: i32, hy: i32, anchor: [f32; 2], s0: [f32; 2] },
+    /// Shift-drag inside: scale around the centre.
+    Center { s0: [f32; 2], d0: [f32; 2] },
+}
+
+/// Grab handles: corners and edge midpoints, as (-1|0|1, -1|0|1).
+const MS_HANDLES: [(i32, i32); 8] = [(-1, -1), (0, -1), (1, -1), (1, 0), (1, 1), (0, 1), (-1, 1), (-1, 0)];
+
+fn rot(v: [f32; 2], a: f32) -> [f32; 2] {
+    let (s, c) = a.sin_cos();
+    [v[0] * c - v[1] * s, v[0] * s + v[1] * c]
+}
+
+/// Transformed selection box: centre, signed half extents, angle.
+#[derive(Clone, Copy)]
+pub struct MsBox {
+    c: [f32; 2],
+    half: [f32; 2],
+    angle: f32,
+}
+
+impl MsBox {
+    fn point(&self, hx: f32, hy: f32) -> [f32; 2] {
+        let v = rot([hx * self.half[0], hy * self.half[1]], self.angle);
+        [self.c[0] + v[0], self.c[1] + v[1]]
+    }
+    fn of_rect(r: IRect) -> MsBox {
+        MsBox { c: [r.x as f32 + r.w as f32 / 2.0, r.y as f32 + r.h as f32 / 2.0], half: [r.w as f32 / 2.0, r.h as f32 / 2.0], angle: 0.0 }
+    }
+}
+
+impl MoveSelectedState {
+    fn bx(&self) -> MsBox {
+        let r = self.lifted_rect;
+        MsBox {
+            c: [r.x as f32 + r.w as f32 / 2.0 + self.offset[0], r.y as f32 + r.h as f32 / 2.0 + self.offset[1]],
+            half: [self.scale[0] * r.w as f32 / 2.0, self.scale[1] * r.h as f32 / 2.0],
+            angle: self.angle,
+        }
+    }
+    /// lifted pixmap local coords -> image coords
+    fn transform(&self) -> Transform {
+        let r = self.lifted_rect;
+        let (hw, hh) = (r.w as f32 / 2.0, r.h as f32 / 2.0);
+        Transform::from_translate(r.x as f32 + self.offset[0] + hw, r.y as f32 + self.offset[1] + hh)
+            .pre_concat(Transform::from_rotate(self.angle.to_degrees()))
+            .pre_scale(self.scale[0], self.scale[1])
+            .pre_translate(-hw, -hh)
+    }
+    fn identity_scale(&self) -> bool {
+        self.scale == [1.0, 1.0]
+    }
+    /// Pick the drag mode for a new press.
+    fn begin(&mut self, p: &Pointer, pick: f32) {
+        let b = self.bx();
+        self.start = [p.pos[0] - self.offset[0], p.pos[1] - self.offset[1]];
+        self.rot_start = (p.pos[1] - b.c[1]).atan2(p.pos[0] - b.c[0]) - self.angle;
+        let hit = MS_HANDLES.iter().copied().filter(|&(hx, hy)| dist(b.point(hx as f32, hy as f32), p.pos) <= pick).min_by(|a, c| {
+            dist(b.point(a.0 as f32, a.1 as f32), p.pos).total_cmp(&dist(b.point(c.0 as f32, c.1 as f32), p.pos))
+        });
+        self.mode = if p.secondary {
+            MsMode::Rotate
+        } else if let Some((hx, hy)) = hit {
+            MsMode::Handle { hx, hy, anchor: b.point(-hx as f32, -hy as f32), s0: self.scale }
+        } else if p.shift {
+            MsMode::Center { s0: self.scale, d0: rot([p.pos[0] - b.c[0], p.pos[1] - b.c[1]], -self.angle) }
+        } else {
+            MsMode::Move
+        };
+    }
+}
+
+fn clamp_scale(s: f32, size: f32) -> f32 {
+    if s.abs() * size < 1.0 {
+        s.signum() / size
+    } else {
+        s
+    }
 }
 
 pub struct TextEdit {
@@ -543,6 +630,9 @@ pub struct Tools {
     /// the content they passed over. Keyed by (doc id, layer id, layer
     /// tile table ptr, selection tile table ptr) to detect outside changes.
     floating: Option<((u64, u64, usize, usize), Box<MoveSelectedState>)>,
+    /// Box + grab handles shown by Move Selected (refreshed in `tick`).
+    ms_box: Option<MsBox>,
+    ms_bounds_cache: Option<((u64, usize), IRect)>,
     pub status: String,
 }
 
@@ -569,6 +659,8 @@ impl Default for Tools {
             clone_source: None,
             clone_offset: None,
             floating: None,
+            ms_box: None,
+            ms_bounds_cache: None,
             status: String::new(),
         }
     }
@@ -811,11 +903,7 @@ impl Tools {
                 // continue moving the still-floating pixels if nothing else touched the layer
                 if let Some((key, mut ms)) = self.floating.take() {
                     if key == floating_key(doc) {
-                        let r = ms.lifted_rect;
-                        let c = [r.x as f32 + r.w as f32 / 2.0 + ms.offset[0], r.y as f32 + r.h as f32 / 2.0 + ms.offset[1]];
-                        ms.start = [p.pos[0] - ms.offset[0], p.pos[1] - ms.offset[1]];
-                        ms.rotating = p.secondary;
-                        ms.rot_start = (p.pos[1] - c[1]).atan2(p.pos[0] - c[0]) - ms.angle;
+                        ms.begin(&p, self.pick_radius * 1.3);
                         self.active = Active::MoveSelected(ms);
                         return ViewRequest::None;
                     }
@@ -854,9 +942,7 @@ impl Tools {
                     }
                 });
                 let lifted = Pixmap::from_vec(data, tiny_skia::IntSize::from_wh(r.w as u32, r.h as u32).unwrap()).unwrap();
-                let center = [r.x as f32 + r.w as f32 / 2.0, r.y as f32 + r.h as f32 / 2.0];
-                let rot_start = (p.pos[1] - center[1]).atan2(p.pos[0] - center[0]);
-                self.active = Active::MoveSelected(Box::new(MoveSelectedState {
+                let mut ms = Box::new(MoveSelectedState {
                     hole,
                     lifted,
                     lifted_rect: r,
@@ -864,9 +950,12 @@ impl Tools {
                     start: p.pos,
                     offset: [0.0, 0.0],
                     angle: 0.0,
-                    rotating: p.secondary,
-                    rot_start,
-                }));
+                    scale: [1.0, 1.0],
+                    mode: MsMode::Move,
+                    rot_start: 0.0,
+                });
+                ms.begin(&p, self.pick_radius * 1.3);
+                self.active = Active::MoveSelected(ms);
             }
             ToolKind::Pan => self.active = Active::Pan { last: p.screen },
             ToolKind::Zoom => self.active = Active::ZoomRect { start: p.pos, end: p.pos, out: p.secondary },
@@ -957,23 +1046,77 @@ impl Tools {
                 self.status = format!("Offset {dx}, {dy}");
             }
             Active::MoveSelected(ms) => {
-                if ms.rotating {
-                    let r = ms.lifted_rect;
-                    let c = [r.x as f32 + r.w as f32 / 2.0 + ms.offset[0], r.y as f32 + r.h as f32 / 2.0 + ms.offset[1]];
-                    let mut a = (p.pos[1] - c[1]).atan2(p.pos[0] - c[0]) - ms.rot_start;
-                    if p.shift {
-                        let step = std::f32::consts::PI / 12.0;
-                        a = (a / step).round() * step;
+                let r = ms.lifted_rect;
+                let (w0, h0) = (r.w as f32, r.h as f32);
+                let base_c = [r.x as f32 + w0 / 2.0, r.y as f32 + h0 / 2.0];
+                match ms.mode {
+                    MsMode::Rotate => {
+                        let c = ms.bx().c;
+                        let mut a = (p.pos[1] - c[1]).atan2(p.pos[0] - c[0]) - ms.rot_start;
+                        if p.shift {
+                            let step = std::f32::consts::PI / 12.0;
+                            a = (a / step).round() * step;
+                        }
+                        ms.angle = a;
                     }
-                    ms.angle = a;
-                } else {
-                    ms.offset = [p.pos[0] - ms.start[0], p.pos[1] - ms.start[1]];
-                    if ms.angle == 0.0 {
-                        ms.offset = [ms.offset[0].round(), ms.offset[1].round()];
+                    MsMode::Move => {
+                        ms.offset = [p.pos[0] - ms.start[0], p.pos[1] - ms.start[1]];
+                        if ms.angle == 0.0 && ms.identity_scale() {
+                            ms.offset = [ms.offset[0].round(), ms.offset[1].round()];
+                        }
+                    }
+                    MsMode::Handle { hx, hy, anchor, s0 } => {
+                        let d = rot([p.pos[0] - anchor[0], p.pos[1] - anchor[1]], -ms.angle);
+                        let (fx, fy) = (hx as f32, hy as f32);
+                        let mut sc = s0;
+                        if p.alt {
+                            // keep proportions: project onto the handle's original direction
+                            let h = [fx * s0[0] * w0, fy * s0[1] * h0];
+                            let k = (d[0] * h[0] + d[1] * h[1]) / (h[0] * h[0] + h[1] * h[1]).max(1e-6);
+                            sc = [s0[0] * k, s0[1] * k];
+                        } else {
+                            if hx != 0 {
+                                sc[0] = d[0] / (fx * w0);
+                            }
+                            if hy != 0 {
+                                sc[1] = d[1] / (fy * h0);
+                            }
+                        }
+                        ms.scale = [clamp_scale(sc[0], w0), clamp_scale(sc[1], h0)];
+                        // the anchor stays fixed; the centre follows
+                        let v = rot([fx * ms.scale[0] * w0 / 2.0, fy * ms.scale[1] * h0 / 2.0], ms.angle);
+                        let c = [anchor[0] + v[0], anchor[1] + v[1]];
+                        ms.offset = [c[0] - base_c[0], c[1] - base_c[1]];
+                    }
+                    MsMode::Center { s0, d0 } => {
+                        // grow/shrink by how far the pointer moved away from the
+                        // centre (pixels), so starting near the centre stays stable
+                        let c = ms.bx().c;
+                        let d = rot([p.pos[0] - c[0], p.pos[1] - c[1]], -ms.angle);
+                        let half0 = [s0[0].abs() * w0 / 2.0, s0[1].abs() * h0 / 2.0];
+                        let k = if p.alt {
+                            let l = (half0[0] * half0[0] + half0[1] * half0[1]).sqrt().max(1.0);
+                            let g = (d[0] * d[0] + d[1] * d[1]).sqrt() - (d0[0] * d0[0] + d0[1] * d0[1]).sqrt();
+                            let kk = ((l + g) / l).max(0.0);
+                            [kk, kk]
+                        } else {
+                            [((half0[0] + d[0].abs() - d0[0].abs()) / half0[0].max(0.5)).max(0.0), ((half0[1] + d[1].abs() - d0[1].abs()) / half0[1].max(0.5)).max(0.0)]
+                        };
+                        ms.scale = [clamp_scale(s0[0] * k[0], w0), clamp_scale(s0[1] * k[1], h0)];
                     }
                 }
                 render_move_selected(doc, ms);
-                self.status = format!("Offset {:.0}, {:.0}  Angle {:.1}°", ms.offset[0], ms.offset[1], ms.angle.to_degrees());
+                let b = ms.bx();
+                self.status = format!(
+                    "Offset {:.0}, {:.0}  Size {:.0} x {:.0} ({:.0}% x {:.0}%)  Angle {:.1}°",
+                    ms.offset[0],
+                    ms.offset[1],
+                    (b.half[0] * 2.0).abs(),
+                    (b.half[1] * 2.0).abs(),
+                    ms.scale[0] * 100.0,
+                    ms.scale[1] * 100.0,
+                    ms.angle.to_degrees()
+                );
             }
             Active::Gradient { base, start, end, swap } => {
                 *end = if p.shift { snap_angle(*start, p.pos) } else { p.pos };
@@ -1055,7 +1198,7 @@ impl Tools {
                 }
             }
             Active::MoveSelected(ms) => {
-                if ms.offset != [0.0, 0.0] || ms.angle != 0.0 {
+                if ms.offset != [0.0, 0.0] || ms.angle != 0.0 || !ms.identity_scale() {
                     if doc.history[doc.history_pos].state.layers.get(doc.state.current).is_none_or(|l| !Arc::ptr_eq(&l.surface.tiles, &doc.state.layer().surface.tiles)) {
                         doc.commit("Move Selected");
                     }
@@ -1156,6 +1299,31 @@ impl Tools {
                 painter.add(egui::Shape::line(pts, dark));
             }
             _ => {}
+        }
+        if let Some(b) = &self.ms_box {
+            let corners = [(-1.0, -1.0), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)].map(|(x, y)| to_screen(b.point(x, y)));
+            for i in 0..4 {
+                let seg = [corners[i], corners[(i + 1) % 4]];
+                painter.line_segment(seg, Stroke::new(3.0, Color32::from_black_alpha(90)));
+                painter.line_segment(seg, Stroke::new(1.0, Color32::from_white_alpha(220)));
+            }
+            let rotating = matches!(&self.active, Active::MoveSelected(ms) if matches!(ms.mode, MsMode::Rotate));
+            for (hx, hy) in MS_HANDLES {
+                let c = to_screen(b.point(hx as f32, hy as f32));
+                let r = egui::Rect::from_center_size(c, egui::vec2(9.0, 9.0));
+                if rotating {
+                    painter.circle_filled(c, 4.5, Color32::WHITE);
+                    painter.circle_stroke(c, 4.5, Stroke::new(1.0, Color32::BLACK));
+                } else {
+                    painter.rect_filled(r, 1.0, Color32::WHITE);
+                    painter.rect_stroke(r, 1.0, Stroke::new(1.0, Color32::BLACK), egui::StrokeKind::Inside);
+                }
+            }
+            if rotating {
+                let c = to_screen(b.c);
+                painter.circle_stroke(c, 4.0, Stroke::new(2.0, Color32::from_black_alpha(160)));
+                painter.circle_stroke(c, 4.0, light);
+            }
         }
         if let Some(le) = &self.line {
             for (i, q) in le.sh.points.iter().enumerate() {
@@ -1412,8 +1580,8 @@ fn render_move_selected(doc: &mut Document, ms: &MoveSelectedState) {
     let cx = r.x as f32 + r.w as f32 / 2.0;
     let cy = r.y as f32 + r.h as f32 / 2.0;
     // transform: lifted pixmap local -> image
-    let t = Transform::from_translate(r.x as f32 + ms.offset[0], r.y as f32 + ms.offset[1]).pre_concat(Transform::from_rotate_at(ms.angle.to_degrees(), r.w as f32 / 2.0, r.h as f32 / 2.0));
-    let integer = ms.angle == 0.0 && ms.offset[0].fract() == 0.0 && ms.offset[1].fract() == 0.0;
+    let t = ms.transform();
+    let integer = ms.angle == 0.0 && ms.identity_scale() && ms.offset[0].fract() == 0.0 && ms.offset[1].fract() == 0.0;
     let sel_none = Selection::default();
     let mut target = ms.hole.clone();
     if integer {
@@ -1432,7 +1600,8 @@ fn render_move_selected(doc: &mut Document, ms: &MoveSelectedState) {
         let dst = IRect::from_f(bb[0], bb[1], bb[2], bb[3]).inflate(1).intersect(&IRect::new(0, 0, w as i32, h as i32));
         if !dst.is_empty() {
             let mut pm = Pixmap::new(dst.w as u32, dst.h as u32).unwrap();
-            let paint = tiny_skia::PixmapPaint { quality: tiny_skia::FilterQuality::Bilinear, ..Default::default() };
+            let quality = if ms.identity_scale() { tiny_skia::FilterQuality::Bilinear } else { tiny_skia::FilterQuality::Bicubic };
+            let paint = tiny_skia::PixmapPaint { quality, ..Default::default() };
             let tt = Transform::from_translate(-dst.x as f32, -dst.y as f32).pre_concat(t);
             pm.draw_pixmap(0, 0, ms.lifted.as_ref(), &paint, tt, None);
             paste_pixmap(&mut target, &ms.hole, &pm, (dst.x, dst.y), &sel_none, PasteMode::Over);
@@ -1667,6 +1836,27 @@ impl Tools {
     /// Re-render the line being edited when its toolbar options change, and
     /// redo the last magic-wand selection live when its tolerance/mode changes.
     pub fn tick(&mut self, doc: &mut Document) {
+        self.ms_box = None;
+        if self.current == ToolKind::MoveSelected {
+            self.ms_box = match &self.active {
+                Active::MoveSelected(ms) => Some(ms.bx()),
+                _ => match &self.floating {
+                    Some((k, ms)) if *k == floating_key(doc) => Some(ms.bx()),
+                    _ => {
+                        let key = (doc.id, doc.state.selection.mask.as_ref().map_or(0, |m| Arc::as_ptr(&m.tiles) as usize));
+                        let r = match self.ms_bounds_cache {
+                            Some((k, r)) if k == key => r,
+                            _ => {
+                                let r = doc.state.selection.bounds(doc.state.width, doc.state.height);
+                                self.ms_bounds_cache = Some((key, r));
+                                r
+                            }
+                        };
+                        (!r.is_empty()).then(|| MsBox::of_rect(r))
+                    }
+                },
+            };
+        }
         let s = &self.settings;
         let wsig = (s.tolerance.to_bits(), s.flood_global, s.wand_from);
         if let Some(w) = self.wand_last.as_mut() {

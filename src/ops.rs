@@ -392,6 +392,52 @@ pub fn invert_selection(doc: &mut Document) {
     doc.commit("Invert Selection");
 }
 
+/// Move the visible pixels of the selection (or the whole layer) so their
+/// bounding box is centred on the canvas, horizontally and/or vertically.
+pub fn center_object(doc: &mut Document, horiz: bool, vert: bool) {
+    let Some((r, data)) = copy_selection(doc, false) else { return };
+    // tight bounds of non-transparent pixels inside the selection
+    let (mut x0, mut y0, mut x1, mut y1) = (i32::MAX, i32::MAX, i32::MIN, i32::MIN);
+    for y in 0..r.h {
+        let row = &data[(y * r.w * 4) as usize..((y + 1) * r.w * 4) as usize];
+        for (x, px) in row.chunks_exact(4).enumerate() {
+            if px[3] != 0 {
+                x0 = x0.min(x as i32);
+                x1 = x1.max(x as i32);
+                y0 = y0.min(y);
+                y1 = y1.max(y);
+            }
+        }
+    }
+    if x0 > x1 {
+        return;
+    }
+    let (w, h) = (doc.state.width as i32, doc.state.height as i32);
+    let ob = IRect::new(r.x + x0, r.y + y0, x1 - x0 + 1, y1 - y0 + 1);
+    let dx = if horiz { (w - ob.w) / 2 - ob.x } else { 0 };
+    let dy = if vert { (h - ob.h) / 2 - ob.y } else { 0 };
+    if dx == 0 && dy == 0 {
+        return;
+    }
+    let sel = doc.state.selection.clone();
+    let base = doc.state.layer().surface.clone();
+    let mut hole = base.clone();
+    crate::raster::map_pixels(&mut hole, &base, r, &sel, |_, _, _| [0, 0, 0, 0]);
+    let mut target = hole.clone();
+    let dst = IRect::new(r.x + dx, r.y + dy, r.w, r.h);
+    crate::raster::paste_rgba(&mut target, &hole, &data, dst, &Selection::default(), crate::raster::PasteMode::Over);
+    target.compact();
+    doc.state.layer_mut().surface = target;
+    if let Some(m) = &sel.mask {
+        doc.state.selection = Selection { mask: Some(m.translated(dx, dy)) };
+    }
+    doc.commit(match (horiz, vert) {
+        (true, true) => "Center",
+        (true, false) => "Center Horizontally",
+        _ => "Center Vertically",
+    });
+}
+
 /// Selected pixels of the current layer (or the flattened image), cropped to
 /// the selection bounds. Returns (w, h, premultiplied rgba).
 pub fn copy_selection(doc: &Document, merged: bool) -> Option<(IRect, Vec<u8>)> {

@@ -964,6 +964,16 @@ impl App {
                 ui.radio_value(&mut self.skin, Skin::Classic, "Classic (Paint.NET-style)");
             });
             ui.menu_button("Image", |ui| {
+                ui.menu_button("Center Object", |ui| {
+                    for (label, hz, vt) in [("Center Both", true, true), ("Center Horizontally", true, false), ("Center Vertically", false, true)] {
+                        if ui.button(label).on_hover_text("Centers the selected pixels (or the whole layer) on the canvas").clicked() {
+                            if let Some(d) = self.doc() {
+                                ops::center_object(d, hz, vt);
+                            }
+                        }
+                    }
+                });
+                ui.separator();
                 if ui.add(egui::Button::new("Crop to Selection").shortcut_text("Ctrl+Shift+X")).clicked() {
                     if let Some(d) = self.doc() {
                         ops::crop_to_selection(d);
@@ -1284,7 +1294,7 @@ impl App {
                 }
             }
             if t == ToolKind::MoveSelected {
-                ui.label("Left drag moves, right drag rotates (Shift snaps)");
+                ui.label("Drag moves · handles or Shift+drag resize (Alt keeps proportions) · right drag rotates (Shift snaps)");
             }
         });
     }

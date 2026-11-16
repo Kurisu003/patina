@@ -61,6 +61,9 @@ impl Script {
             if w.contains(&"shift") {
                 m = m | Modifiers::SHIFT;
             }
+            if w.contains(&"alt") {
+                m = m | Modifiers::ALT;
+            }
             m
         };
         match cmd {
