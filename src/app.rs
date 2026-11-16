@@ -42,7 +42,7 @@ struct EffectJob {
 
 enum Dialog {
     None,
-    Preferences { w: u32, h: u32, bg: u8 },
+    Preferences { w: u32, h: u32, bg: u8, skin: Skin },
     /// Clipboard image: paste into the current image or open as a new one.
     PasteChoice { w: u32, h: u32, data: Arc<Vec<u8>>, fit: ops::PasteFit },
     /// Files dropped onto the window while an image is open.
@@ -100,6 +100,8 @@ pub enum Skin {
     Pinta,
     /// Paint.NET-style layout: light theme, floating tool windows.
     Classic,
+    /// Paint.NET-style layout with Paint.NET's dark theme.
+    ClassicDark,
 }
 
 impl Skin {
@@ -111,13 +113,24 @@ impl Skin {
         let text = Self::path().and_then(|p| std::fs::read_to_string(p).ok()).or_else(|| old.and_then(|p| std::fs::read_to_string(p).ok()));
         match text.as_deref().map(str::trim) {
             Some("classic") => Skin::Classic,
+            Some("classic-dark") => Skin::ClassicDark,
             _ => Skin::Pinta,
         }
+    }
+    fn is_classic(self) -> bool {
+        self != Skin::Pinta
     }
     fn save(self) {
         if let Some(p) = Self::path() {
             let _ = std::fs::create_dir_all(p.parent().unwrap());
-            let _ = std::fs::write(p, if self == Skin::Classic { "classic" } else { "pinta" });
+            let _ = std::fs::write(
+                p,
+                match self {
+                    Skin::Classic => "classic",
+                    Skin::ClassicDark => "classic-dark",
+                    Skin::Pinta => "pinta",
+                },
+            );
         }
     }
 }
@@ -175,6 +188,28 @@ fn classic_visuals() -> egui::Visuals {
     v.widgets.hovered.weak_bg_fill = Color32::from_rgb(204, 228, 252);
     v.widgets.hovered.bg_stroke = egui::Stroke::new(1.0, accent);
     v.widgets.active.weak_bg_fill = Color32::from_rgb(170, 210, 250);
+    v
+}
+
+/// Paint.NET's dark theme: neutral dark greys with its blue accent.
+fn classic_dark_visuals() -> egui::Visuals {
+    let mut v = egui::Visuals::dark();
+    let accent = Color32::from_rgb(0, 120, 215);
+    v.panel_fill = Color32::from_rgb(43, 43, 43);
+    v.window_fill = Color32::from_rgb(50, 50, 50);
+    v.extreme_bg_color = Color32::from_rgb(30, 30, 30);
+    v.faint_bg_color = Color32::from_rgb(48, 48, 48);
+    v.selection.bg_fill = accent;
+    v.selection.stroke = egui::Stroke::new(1.0, Color32::WHITE);
+    v.hyperlink_color = Color32::from_rgb(90, 170, 255);
+    v.window_stroke = egui::Stroke::new(1.0, Color32::from_rgb(70, 70, 70));
+    v.window_corner_radius = egui::CornerRadius::same(4);
+    v.widgets.noninteractive.bg_fill = Color32::from_rgb(43, 43, 43);
+    v.widgets.inactive.weak_bg_fill = Color32::from_rgb(60, 60, 60);
+    v.widgets.inactive.bg_fill = Color32::from_rgb(60, 60, 60);
+    v.widgets.hovered.weak_bg_fill = Color32::from_rgb(62, 82, 105);
+    v.widgets.hovered.bg_stroke = egui::Stroke::new(1.0, accent);
+    v.widgets.active.weak_bg_fill = Color32::from_rgb(0, 95, 170);
     v
 }
 
@@ -1013,7 +1048,7 @@ impl App {
                 ui.separator();
                 if ui.button("Preferences...").clicked() {
                     let p = self.prefs;
-                    self.dialog = Dialog::Preferences { w: p.w, h: p.h, bg: p.bg };
+                    self.dialog = Dialog::Preferences { w: p.w, h: p.h, bg: p.bg, skin: self.skin };
                 }
             });
             ui.menu_button("View", |ui| {
@@ -1043,6 +1078,7 @@ impl App {
                 ui.label("Skin");
                 ui.radio_value(&mut self.skin, Skin::Pinta, "Pinta");
                 ui.radio_value(&mut self.skin, Skin::Classic, "Classic (Paint.NET-style)");
+                ui.radio_value(&mut self.skin, Skin::ClassicDark, "Classic Dark (Paint.NET dark)");
             });
             ui.menu_button("Image", |ui| {
                 ui.menu_button("Center Object", |ui| {
@@ -1148,7 +1184,7 @@ impl App {
                     });
                 }
             });
-            if self.skin == Skin::Classic {
+            if self.skin.is_classic() {
                 ui.menu_button("Window", |ui| {
                     ui.checkbox(&mut self.win_tools, "Tools  (F5)");
                     ui.checkbox(&mut self.win_history, "History  (F6)");
@@ -1900,8 +1936,15 @@ impl App {
         let mut act: Option<Box<dyn FnOnce(&mut App)>> = None;
         match &mut self.dialog {
             Dialog::None => {}
-            Dialog::Preferences { w, h, bg } => {
+            Dialog::Preferences { w, h, bg, skin } => {
                 egui::Window::new("Preferences").collapsible(false).resizable(false).anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO).order(egui::Order::Foreground).show(ctx, |ui| {
+                    ui.strong("Appearance");
+                    ui.horizontal(|ui| {
+                        ui.radio_value(skin, Skin::Pinta, "Pinta");
+                        ui.radio_value(skin, Skin::Classic, "Paint.NET light");
+                        ui.radio_value(skin, Skin::ClassicDark, "Paint.NET dark");
+                    });
+                    ui.separator();
                     ui.strong("Default canvas");
                     ui.weak("Used for the image Patina starts with and as the New Image size.");
                     ui.add_space(4.0);
@@ -1935,9 +1978,11 @@ impl App {
                         }
                         if ui.add(egui::Button::new("Save").fill(ui.visuals().selection.bg_fill)).clicked() {
                             let p = Prefs { w: *w, h: *h, bg: *bg };
+                            let sk = *skin;
                             act = Some(Box::new(move |app: &mut App| {
                                 app.prefs = p;
                                 p.save();
+                                app.skin = sk;
                             }));
                             close = true;
                         }
@@ -2699,11 +2744,15 @@ impl eframe::App for App {
         ctx.send_viewport_cmd(egui::ViewportCommand::Title(title));
 
         if self.skin_applied != Some(self.skin) {
-            ctx.set_visuals(if self.skin == Skin::Classic { classic_visuals() } else { egui::Visuals::dark() });
+            ctx.set_visuals(match self.skin {
+                Skin::Classic => classic_visuals(),
+                Skin::ClassicDark => classic_dark_visuals(),
+                Skin::Pinta => egui::Visuals::dark(),
+            });
             self.skin.save();
             self.skin_applied = Some(self.skin);
         }
-        if self.skin == Skin::Classic {
+        if self.skin.is_classic() {
             self.classic_ui(ui, &ctx);
             self.dialogs(&ctx);
             self.frame_ms = self.frame_ms * 0.9 + t0.elapsed().as_secs_f32() * 1000.0 * 0.1;
