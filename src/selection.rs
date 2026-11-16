@@ -23,7 +23,7 @@ impl MTile {
             MTile::Partial(p) => p[y * TILE + x],
         }
     }
-    fn normalize(data: Box<[u8; TILE_PX]>) -> MTile {
+    pub(crate) fn normalize(data: Box<[u8; TILE_PX]>) -> MTile {
         if data.iter().all(|&v| v == 0) {
             MTile::Empty
         } else if data.iter().all(|&v| v == 255) {
@@ -114,7 +114,7 @@ impl Mask {
 
     /// Build a mask with a per-tile generator. `f` gets the tile rect (in image
     /// space, already clipped to the image) and returns the tile.
-    fn build<F: Fn(IRect, IRect) -> MTile + Sync>(width: u32, height: u32, f: F) -> Mask {
+    pub(crate) fn build<F: Fn(IRect, IRect) -> MTile + Sync>(width: u32, height: u32, f: F) -> Mask {
         let mut m = Mask::empty(width, height);
         let img = m.image_rect();
         let tx = m.tiles_x;

@@ -19,6 +19,59 @@ fn ptr(x: f32, y: f32) -> Pointer {
     Pointer { pos: [x, y], screen: [x, y], secondary: false, shift: false, ctrl: false, alt: false }
 }
 
+/// `--bench-scale [size]`: time Move Selected resize/rotate drag frames.
+pub fn bench_scale(size: u32) {
+    let (w, h) = (size * 2, size * 2);
+    let mut doc = Document::new("bench", w, h, Some([255, 255, 255, 255]));
+    let b = doc.state.layers[0].surface.bounds();
+    doc.state.layers[0].surface.par_tiles_mut(b, true, |tile, tr| {
+        for y in 0..TILE {
+            for x in 0..TILE {
+                let gx = (tr.x + x as i32) as u32;
+                let gy = (tr.y + y as i32) as u32;
+                tile.set(x, y, premul([(gx / 7 % 256) as u8, (gy / 5 % 256) as u8, ((gx ^ gy) % 256) as u8, 255]));
+            }
+        }
+    });
+    let r = IRect::new((size / 2) as i32, (size / 2) as i32, size as i32, size as i32);
+    doc.state.selection = crate::selection::Selection { mask: Some(crate::selection::Mask::from_rect(w, h, r)) };
+    doc.commit("sel");
+    let mut tools = Tools::default();
+    tools.current = ToolKind::MoveSelected;
+    tools.pick_radius = 4.0;
+    tools.view_zoom = std::env::var("BENCH_ZOOM").ok().and_then(|z| z.parse().ok()).unwrap_or(1.0);
+    let mut pal = Palette::default();
+    println!("move-selected bench: {w} x {h} image, {size} x {size} selection");
+    let corner = [r.right() as f32, r.bottom() as f32];
+    t("press on corner handle (lift)", || tools.press(&mut doc, &mut pal, ptr(corner[0], corner[1])));
+    let mut times = Vec::new();
+    for i in 1..=10 {
+        let d = i as f32 * size as f32 * 0.03;
+        let t0 = Instant::now();
+        tools.drag(&mut doc, &mut pal, ptr(corner[0] + d, corner[1] + d * 0.7));
+        times.push(t0.elapsed().as_secs_f64() * 1000.0);
+    }
+    println!("{:<44} {:>9.1} ms (avg of 10, max {:.1})", "scale drag frame", times.iter().sum::<f64>() / 10.0, times.iter().cloned().fold(0.0, f64::max));
+    t("release", || tools.release(&mut doc, &mut pal, ptr(corner[0] + size as f32 * 0.3, corner[1] + size as f32 * 0.21)));
+    // rotate the scaled selection
+    let c = [r.x as f32 + r.w as f32 / 2.0, r.y as f32 + r.h as f32 / 2.0];
+    let mut p = ptr(c[0] + 10.0, c[1]);
+    p.secondary = true;
+    tools.press(&mut doc, &mut pal, p);
+    let mut times = Vec::new();
+    for i in 1..=10 {
+        let a = i as f32 * 0.05;
+        let mut p = ptr(c[0] + 10.0 * a.cos(), c[1] + 10.0 * a.sin());
+        p.secondary = true;
+        let t0 = Instant::now();
+        tools.drag(&mut doc, &mut pal, p);
+        times.push(t0.elapsed().as_secs_f64() * 1000.0);
+    }
+    println!("{:<44} {:>9.1} ms (avg of 10, max {:.1})", "rotate drag frame (scaled)", times.iter().sum::<f64>() / 10.0, times.iter().cloned().fold(0.0, f64::max));
+    let mut sync = Pyramid::new(w, h);
+    t("pyramid sync after", || sync.sync(&doc.state));
+}
+
 pub fn run(size: u32) {
     let (w, h) = (size, size);
     println!("self-test on a {w} x {h} image ({:.0} MP)", (w as f64 * h as f64) / 1e6);

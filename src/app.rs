@@ -1628,6 +1628,7 @@ impl App {
         let to_img = move |p: Pos2| [center[0] + (p.x - rc.x) / z, center[1] + (p.y - rc.y) / z];
         self.cursor = hover.filter(|h| rect.contains(*h)).map(to_img);
         self.tools.pick_radius = 7.0 / z;
+        self.tools.view_zoom = z;
         self.tools.tick(doc);
         let modal = !matches!(self.dialog, Dialog::None) || self.palette_edit.is_some();
         if self.job.is_none() && !modal {
@@ -1697,6 +1698,7 @@ impl App {
         let tl = to_img(rect.min);
         let br = to_img(rect.max);
         let vis = IRect::from_f(tl[0], tl[1], br[0], br[1]).intersect(&IRect::new(0, 0, w as i32, h as i32));
+        self.tools.view_rect = Some(vis);
         let pyr = self.pyramids.entry(doc.id).or_insert_with(|| Pyramid::new(w, h));
         pyr.sync(&doc.state);
         let zoom = doc.view.zoom;

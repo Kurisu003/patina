@@ -496,6 +496,69 @@ struct MoveSelectedState {
     scale: [f32; 2],
     mode: MsMode,
     rot_start: f32,
+    /// Selection coverage over `lifted_rect`, built on first transform.
+    mask_local: std::sync::OnceLock<MaskLocal>,
+}
+
+/// Selection coverage over the lifted rect plus 16x16 block min/max, so
+/// whole destination tiles can be classified Full/Empty without sampling.
+struct MaskLocal {
+    data: Vec<u8>,
+    bmin: Vec<u8>,
+    bmax: Vec<u8>,
+    bw: i32,
+}
+
+const MB: i32 = 16;
+
+impl MaskLocal {
+    fn new(mask: &Mask, r: IRect) -> MaskLocal {
+        use rayon::prelude::*;
+        let (lw, lh) = (r.w, r.h);
+        let mut data = vec![0u8; (lw * lh) as usize];
+        data.par_chunks_mut(lw as usize).enumerate().for_each(|(y, row)| {
+            for (x, o) in row.iter_mut().enumerate() {
+                *o = mask.get(r.x + x as i32, r.y + y as i32);
+            }
+        });
+        let bw = (lw + MB - 1) / MB;
+        let bh = (lh + MB - 1) / MB;
+        let stats: Vec<(u8, u8)> = (0..bw * bh)
+            .into_par_iter()
+            .map(|i| {
+                let (bx, by) = (i % bw, i / bw);
+                let (mut lo, mut hi) = (255u8, 0u8);
+                for y in by * MB..((by + 1) * MB).min(lh) {
+                    for x in bx * MB..((bx + 1) * MB).min(lw) {
+                        let v = data[(y * lw + x) as usize];
+                        lo = lo.min(v);
+                        hi = hi.max(v);
+                    }
+                }
+                (lo, hi)
+            })
+            .collect();
+        MaskLocal { data, bmin: stats.iter().map(|s| s.0).collect(), bmax: stats.iter().map(|s| s.1).collect(), bw }
+    }
+    /// (all 255, all 0) over local pixel range [x0,x1]x[y0,y1] (inclusive, clamped)
+    fn range_uniform(&self, lw: i32, lh: i32, x0: i32, y0: i32, x1: i32, y1: i32) -> (bool, bool) {
+        let (x0, y0, x1, y1) = (x0.max(0), y0.max(0), x1.min(lw - 1), y1.min(lh - 1));
+        if x0 > x1 || y0 > y1 {
+            return (false, true);
+        }
+        let (mut full, mut empty) = (true, true);
+        for by in y0 / MB..=y1 / MB {
+            for bx in x0 / MB..=x1 / MB {
+                let i = (by * self.bw + bx) as usize;
+                full &= self.bmin[i] == 255;
+                empty &= self.bmax[i] == 0;
+                if !full && !empty {
+                    return (false, false);
+                }
+            }
+        }
+        (full, empty)
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -617,6 +680,10 @@ pub struct Tools {
     pub line: Option<LineEdit>,
     /// Hit radius for handles, in image pixels (set by the canvas each frame).
     pub pick_radius: f32,
+    /// Current view zoom (screen px per image px), set by the canvas.
+    pub view_zoom: f32,
+    /// Visible image area, set by the canvas; live previews render only this.
+    pub view_rect: Option<IRect>,
     pub text_params: crate::text::TextParams,
     pub current: ToolKind,
     pub previous: ToolKind,
@@ -659,6 +726,8 @@ impl Default for Tools {
             clone_source: None,
             clone_offset: None,
             floating: None,
+            view_zoom: 1.0,
+            view_rect: None,
             ms_box: None,
             ms_bounds_cache: None,
             status: String::new(),
@@ -953,6 +1022,7 @@ impl Tools {
                     scale: [1.0, 1.0],
                     mode: MsMode::Move,
                     rot_start: 0.0,
+                    mask_local: std::sync::OnceLock::new(),
                 });
                 ms.begin(&p, self.pick_radius * 1.3);
                 self.active = Active::MoveSelected(ms);
@@ -1105,7 +1175,9 @@ impl Tools {
                         ms.scale = [clamp_scale(s0[0] * k[0], w0), clamp_scale(s0[1] * k[1], h0)];
                     }
                 }
-                render_move_selected(doc, ms);
+                // live preview at the resolution on screen; release renders full quality
+                let k = if self.view_zoom < 1.0 { ((1.0 / self.view_zoom).log2().floor().clamp(0.0, 3.0) as i32).max(0) } else { 0 };
+                render_move_selected(doc, ms, 1 << k, self.view_rect);
                 let b = ms.bx();
                 self.status = format!(
                     "Offset {:.0}, {:.0}  Size {:.0} x {:.0} ({:.0}% x {:.0}%)  Angle {:.1}°",
@@ -1199,6 +1271,9 @@ impl Tools {
             }
             Active::MoveSelected(ms) => {
                 if ms.offset != [0.0, 0.0] || ms.angle != 0.0 || !ms.identity_scale() {
+                    if ms.angle != 0.0 || !ms.identity_scale() {
+                        render_move_selected(doc, &ms, 1, None);
+                    }
                     if doc.history[doc.history_pos].state.layers.get(doc.state.current).is_none_or(|l| !Arc::ptr_eq(&l.surface.tiles, &doc.state.layer().surface.tiles)) {
                         doc.commit("Move Selected");
                     }
@@ -1574,13 +1649,11 @@ fn render_gradient(doc: &mut Document, base: &Surface, start: [f32; 2], end: [f3
     doc.state.layer_mut().surface = target;
 }
 
-fn render_move_selected(doc: &mut Document, ms: &MoveSelectedState) {
+/// `block` > 1 renders a fast preview: one sample per block x block pixels.
+/// `clip` limits a live preview to the visible area.
+fn render_move_selected(doc: &mut Document, ms: &MoveSelectedState, block: i32, clip: Option<IRect>) {
     let (w, h) = (doc.state.width, doc.state.height);
     let r = ms.lifted_rect;
-    let cx = r.x as f32 + r.w as f32 / 2.0;
-    let cy = r.y as f32 + r.h as f32 / 2.0;
-    // transform: lifted pixmap local -> image
-    let t = ms.transform();
     let integer = ms.angle == 0.0 && ms.identity_scale() && ms.offset[0].fract() == 0.0 && ms.offset[1].fract() == 0.0;
     let sel_none = Selection::default();
     let mut target = ms.hole.clone();
@@ -1588,41 +1661,181 @@ fn render_move_selected(doc: &mut Document, ms: &MoveSelectedState) {
         let dst = IRect::new(r.x + ms.offset[0] as i32, r.y + ms.offset[1] as i32, r.w, r.h);
         paste_rgba(&mut target, &ms.hole, ms.lifted.data(), dst, &sel_none, PasteMode::Over);
         doc.state.selection = Selection { mask: Some(ms.mask.translated(ms.offset[0] as i32, ms.offset[1] as i32)) };
-    } else {
-        // bounding box of rotated rect
-        let corners = [(0.0, 0.0), (r.w as f32, 0.0), (0.0, r.h as f32), (r.w as f32, r.h as f32)];
-        let mut bb = [f32::MAX, f32::MAX, f32::MIN, f32::MIN];
-        for (x, y) in corners {
-            let mut p = tiny_skia::Point::from_xy(x, y);
-            t.map_points(std::slice::from_mut(&mut p));
-            bb = [bb[0].min(p.x), bb[1].min(p.y), bb[2].max(p.x), bb[3].max(p.y)];
+        doc.state.layer_mut().surface = target;
+        return;
+    }
+    let t = ms.transform();
+    let Some(inv) = t.invert() else { return };
+    // destination bounding box of the transformed rect
+    let mut bb = [f32::MAX, f32::MAX, f32::MIN, f32::MIN];
+    for (x, y) in [(0.0, 0.0), (r.w as f32, 0.0), (0.0, r.h as f32), (r.w as f32, r.h as f32)] {
+        let mut p = tiny_skia::Point::from_xy(x, y);
+        t.map_points(std::slice::from_mut(&mut p));
+        bb = [bb[0].min(p.x), bb[1].min(p.y), bb[2].max(p.x), bb[3].max(p.y)];
+    }
+    let mut dst = IRect::from_f(bb[0], bb[1], bb[2], bb[3]).inflate(1).intersect(&IRect::new(0, 0, w as i32, h as i32));
+    if let Some(v) = clip {
+        dst = dst.intersect(&v.inflate(TILE as i32));
+    }
+    if dst.is_empty() {
+        doc.state.selection = Selection { mask: Some(Mask::empty(w, h)) };
+        doc.state.layer_mut().surface = target;
+        return;
+    }
+    let (lw, lh) = (r.w, r.h);
+    let src = ms.lifted.data();
+    let mlocal: &MaskLocal = ms.mask_local.get_or_init(|| MaskLocal::new(&ms.mask, r));
+    let ml: &[u8] = &mlocal.data;
+    // Bilinear inverse mapping, one tile per thread. When shrinking, take
+    // n x n samples per pixel so detail averages instead of aliasing.
+    let shrink = 1.0 / ms.scale[0].abs().min(ms.scale[1].abs()).max(1e-3);
+    let n = (shrink.ceil() as i32).clamp(1, 4);
+    let iv = [inv.sx, inv.kx, inv.tx, inv.ky, inv.sy, inv.ty];
+    let kb = block.max(1);
+    target.par_tiles_mut(dst, true, |tile, tr| {
+        let c = tr.intersect(&dst);
+        if kb > 1 {
+            // blocks aligned to absolute multiples of kb (tiles are multiples of 8)
+            let mut by = c.y - c.y.rem_euclid(kb);
+            while by < c.bottom() {
+                let mut bx = c.x - c.x.rem_euclid(kb);
+                while bx < c.right() {
+                    let px = bx as f32 + kb as f32 / 2.0;
+                    let py = by as f32 + kb as f32 / 2.0;
+                    let u = iv[0] * px + iv[1] * py + iv[2];
+                    let v = iv[3] * px + iv[4] * py + iv[5];
+                    if u > -0.5 && v > -0.5 && u < lw as f32 + 0.5 && v < lh as f32 + 0.5 {
+                        let s4 = bilinear4(src, lw, lh, u - 0.5, v - 0.5);
+                        let s = [s4[0] as u8, s4[1] as u8, s4[2] as u8, s4[3] as u8];
+                        if s[3] != 0 {
+                            for y in by.max(c.y)..(by + kb).min(c.bottom()) {
+                                let row = (y - tr.y) as usize * TILE;
+                                for x in bx.max(c.x)..(bx + kb).min(c.right()) {
+                                    let i = (row + (x - tr.x) as usize) * 4;
+                                    if s[3] == 255 {
+                                        tile.px[i..i + 4].copy_from_slice(&s);
+                                    } else {
+                                        crate::raster::over(&mut tile.px[i..i + 4], s, 255);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    bx += kb;
+                }
+                by += kb;
+            }
+            return;
         }
-        let dst = IRect::from_f(bb[0], bb[1], bb[2], bb[3]).inflate(1).intersect(&IRect::new(0, 0, w as i32, h as i32));
-        if !dst.is_empty() {
-            let mut pm = Pixmap::new(dst.w as u32, dst.h as u32).unwrap();
-            let quality = if ms.identity_scale() { tiny_skia::FilterQuality::Bilinear } else { tiny_skia::FilterQuality::Bicubic };
-            let paint = tiny_skia::PixmapPaint { quality, ..Default::default() };
-            let tt = Transform::from_translate(-dst.x as f32, -dst.y as f32).pre_concat(t);
-            pm.draw_pixmap(0, 0, ms.lifted.as_ref(), &paint, tt, None);
-            paste_pixmap(&mut target, &ms.hole, &pm, (dst.x, dst.y), &sel_none, PasteMode::Over);
-            // transform the selection mask the same way
-            let mut mp = Pixmap::new(r.w as u32, r.h as u32).unwrap();
-            for y in 0..r.h {
-                for x in 0..r.w {
-                    let a = ms.mask.get(r.x + x, r.y + y);
-                    let i = ((y * r.w + x) * 4) as usize;
-                    mp.data_mut()[i..i + 4].copy_from_slice(&[a, a, a, a]);
+        for y in c.y..c.bottom() {
+            for x in c.x..c.right() {
+                let mut acc = [0u32; 4];
+                for sy in 0..n {
+                    for sx in 0..n {
+                        let px = x as f32 + (sx as f32 + 0.5) / n as f32;
+                        let py = y as f32 + (sy as f32 + 0.5) / n as f32;
+                        let u = iv[0] * px + iv[1] * py + iv[2];
+                        let v = iv[3] * px + iv[4] * py + iv[5];
+                        if u <= -0.5 || v <= -0.5 || u >= lw as f32 + 0.5 || v >= lh as f32 + 0.5 {
+                            continue;
+                        }
+                        let s = bilinear4(src, lw, lh, u - 0.5, v - 0.5);
+                        for k in 0..4 {
+                            acc[k] += s[k];
+                        }
+                    }
+                }
+                let nn = (n * n) as u32;
+                let s = [((acc[0] + nn / 2) / nn) as u8, ((acc[1] + nn / 2) / nn) as u8, ((acc[2] + nn / 2) / nn) as u8, ((acc[3] + nn / 2) / nn) as u8];
+                if s[3] != 0 {
+                    let i = ((y - tr.y) as usize * TILE + (x - tr.x) as usize) * 4;
+                    crate::raster::over(&mut tile.px[i..i + 4], s, 255);
                 }
             }
-            let mut out = Pixmap::new(dst.w as u32, dst.h as u32).unwrap();
-            out.draw_pixmap(0, 0, mp.as_ref(), &paint, tt, None);
-            let od = out.data().to_vec();
-            let m = Mask::from_fn(w, h, dst, move |x, y| od[(((y - dst.y) * dst.w + (x - dst.x)) * 4 + 3) as usize]);
-            doc.state.selection = Selection { mask: Some(m) };
         }
-        let _ = (cx, cy);
-    }
+    });
+    let m = Mask::build(w, h, |tr, clip| {
+        let c = clip.intersect(&dst);
+        if c.is_empty() {
+            return MTile::Empty;
+        }
+        // preimage bounds of this tile in lifted-local pixels
+        let (mut u0, mut v0, mut u1, mut v1) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
+        for (x, y) in [(c.x, c.y), (c.right(), c.y), (c.x, c.bottom()), (c.right(), c.bottom())] {
+            let (x, y) = (x as f32, y as f32);
+            let u = iv[0] * x + iv[1] * y + iv[2];
+            let v = iv[3] * x + iv[4] * y + iv[5];
+            u0 = u0.min(u);
+            u1 = u1.max(u);
+            v0 = v0.min(v);
+            v1 = v1.max(v);
+        }
+        let pad = kb as f32 + 1.0;
+        let inside = u0 - pad >= 0.0 && v0 - pad >= 0.0 && u1 + pad <= lw as f32 && v1 + pad <= lh as f32;
+        let (full, empty) = mlocal.range_uniform(lw, lh, (u0 - pad).floor() as i32, (v0 - pad).floor() as i32, (u1 + pad).ceil() as i32, (v1 + pad).ceil() as i32);
+        if empty {
+            return MTile::Empty;
+        }
+        if full && inside && c == clip {
+            return MTile::Full;
+        }
+        let mut d: Box<[u8; TILE_PX]> = vec![0u8; TILE_PX].into_boxed_slice().try_into().unwrap();
+        for y in c.y..c.bottom() {
+            for x in c.x..c.right() {
+                let (sx, sy, half) = if kb > 1 { (x - x.rem_euclid(kb), y - y.rem_euclid(kb), kb as f32 / 2.0) } else { (x, y, 0.5) };
+                let px = sx as f32 + half;
+                let py = sy as f32 + half;
+                let u = iv[0] * px + iv[1] * py + iv[2];
+                let v = iv[3] * px + iv[4] * py + iv[5];
+                if u <= -0.5 || v <= -0.5 || u >= lw as f32 + 0.5 || v >= lh as f32 + 0.5 {
+                    continue;
+                }
+                d[(y - tr.y) as usize * TILE + (x - tr.x) as usize] = bilinear1(ml, lw, lh, u - 0.5, v - 0.5);
+            }
+        }
+        MTile::normalize(d)
+    });
+    doc.state.selection = Selection { mask: Some(m) };
     doc.state.layer_mut().surface = target;
+}
+
+/// Bilinear sample of premultiplied RGBA at (fu, fv) in pixel-centre space;
+/// outside texels are transparent. Returns 0..=255 per channel.
+#[inline]
+fn bilinear4(src: &[u8], w: i32, h: i32, fu: f32, fv: f32) -> [u32; 4] {
+    let x0 = fu.floor();
+    let y0 = fv.floor();
+    let wx = ((fu - x0) * 256.0) as u32;
+    let wy = ((fv - y0) * 256.0) as u32;
+    let (x0, y0) = (x0 as i32, y0 as i32);
+    let px = |x: i32, y: i32| -> [u32; 4] {
+        if x < 0 || y < 0 || x >= w || y >= h {
+            return [0; 4];
+        }
+        let i = ((y * w + x) * 4) as usize;
+        [src[i] as u32, src[i + 1] as u32, src[i + 2] as u32, src[i + 3] as u32]
+    };
+    let (a, b, c, d) = (px(x0, y0), px(x0 + 1, y0), px(x0, y0 + 1), px(x0 + 1, y0 + 1));
+    let mut o = [0u32; 4];
+    for k in 0..4 {
+        let top = a[k] * (256 - wx) + b[k] * wx;
+        let bot = c[k] * (256 - wx) + d[k] * wx;
+        o[k] = (top * (256 - wy) + bot * wy + 32768) >> 16;
+    }
+    o
+}
+
+#[inline]
+fn bilinear1(src: &[u8], w: i32, h: i32, fu: f32, fv: f32) -> u8 {
+    let x0 = fu.floor();
+    let y0 = fv.floor();
+    let wx = ((fu - x0) * 256.0) as u32;
+    let wy = ((fv - y0) * 256.0) as u32;
+    let (x0, y0) = (x0 as i32, y0 as i32);
+    let px = |x: i32, y: i32| -> u32 { if x < 0 || y < 0 || x >= w || y >= h { 0 } else { src[(y * w + x) as usize] as u32 } };
+    let top = px(x0, y0) * (256 - wx) + px(x0 + 1, y0) * wx;
+    let bot = px(x0, y0 + 1) * (256 - wx) + px(x0 + 1, y0 + 1) * wx;
+    ((top * (256 - wy) + bot * wy + 32768) >> 16) as u8
 }
 
 impl TextEdit {
