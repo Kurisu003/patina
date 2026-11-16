@@ -739,7 +739,7 @@ mod tests {
     #[test]
     #[ignore]
     fn pinta_reference_images() {
-        let dir = std::path::PathBuf::from(std::env::var("PINTA_ASSETS").unwrap_or_else(|_| "/home/kurisu/src/pinta-upstream/tests/Pinta.Effects.Tests/Assets".into()));
+        let dir = std::path::PathBuf::from(std::env::var("PINTA_ASSETS").unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/../pinta-upstream/tests/Pinta.Effects.Tests/Assets").into()));
         if !dir.exists() {
             return;
         }

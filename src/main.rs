@@ -1,4 +1,4 @@
-//! Pinta-rs: a Rust port of Pinta (https://github.com/PintaProject/Pinta)
+//! Patina: a Rust port of Pinta (https://github.com/PintaProject/Pinta)
 //! with a tiled, GPU-rendered canvas for very large images.
 
 mod app;
@@ -23,7 +23,7 @@ use egui_wgpu::wgpu;
 use std::sync::Arc;
 
 fn main() -> eframe::Result {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("pinta_rs=info,wgpu=warn")).init();
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("patina=info,wgpu=warn")).init();
     // winit only delivers dropped files on X11, so prefer XWayland when an X
     // display exists (KDE scales X11 apps sharply). PINTA_WAYLAND=1 forces
     // native Wayland.
@@ -49,7 +49,7 @@ fn main() -> eframe::Result {
         let a = adapter.limits();
         let base = if adapter.get_info().backend == wgpu::Backend::Gl { wgpu::Limits::downlevel_webgl2_defaults() } else { wgpu::Limits::default() };
         wgpu::DeviceDescriptor {
-            label: Some("pinta-rs device"),
+            label: Some("patina device"),
             required_limits: wgpu::Limits {
                 max_texture_dimension_2d: a.max_texture_dimension_2d.min(16384),
                 // the canvas tile cache is a texture array; more layers = more cached tiles
@@ -62,7 +62,7 @@ fn main() -> eframe::Result {
 
     let options = eframe::NativeOptions {
         renderer: eframe::Renderer::Wgpu,
-        viewport: egui::ViewportBuilder::default().with_inner_size([1280.0, 860.0]).with_min_inner_size([640.0, 400.0]).with_title("Pinta-rs").with_app_id("pinta-rs").with_drag_and_drop(true),
+        viewport: egui::ViewportBuilder::default().with_inner_size([1280.0, 860.0]).with_min_inner_size([640.0, 400.0]).with_title("Patina").with_app_id("patina").with_drag_and_drop(true),
         wgpu_options: egui_wgpu::WgpuConfiguration { wgpu_setup: egui_wgpu::WgpuSetup::CreateNew(setup), ..Default::default() },
         // deliver Ctrl+X/C/V as plain keys: egui-winit's own paste drops the
         // key when the clipboard holds only an image (its Wayland backend
@@ -71,7 +71,7 @@ fn main() -> eframe::Result {
         ..Default::default()
     };
     eframe::run_native(
-        "Pinta-rs",
+        "Patina",
         options,
         Box::new(|cc| {
             if let Some(rs) = cc.wgpu_render_state.as_ref() {

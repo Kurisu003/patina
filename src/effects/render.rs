@@ -1421,7 +1421,7 @@ mod tests {
 
     // --- comparison against Pinta's own test images (when the upstream checkout exists) ---
 
-    const ASSETS: &str = "/home/kurisu/src/pinta-upstream/tests/Pinta.Effects.Tests/Assets";
+    const ASSETS: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../pinta-upstream/tests/Pinta.Effects.Tests/Assets");
 
     fn load_png(name: &str) -> Option<Surface> {
         let img = image::open(format!("{ASSETS}/{name}")).ok()?.to_rgba8();

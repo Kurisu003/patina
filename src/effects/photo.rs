@@ -851,7 +851,7 @@ mod tests {
     // ---- comparison against Pinta's reference images ----
 
     fn pinta_assets() -> Option<std::path::PathBuf> {
-        let p = std::path::PathBuf::from(std::env::var("PINTA_ASSETS").unwrap_or_else(|_| "/home/kurisu/src/pinta-upstream/tests/Pinta.Effects.Tests/Assets".into()));
+        let p = std::path::PathBuf::from(std::env::var("PINTA_ASSETS").unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/../pinta-upstream/tests/Pinta.Effects.Tests/Assets").into()));
         p.exists().then_some(p)
     }
 

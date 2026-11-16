@@ -1,4 +1,4 @@
-//! `pinta-rs --selftest [size]`: headless correctness checks and timings of
+//! `patina --selftest [size]`: headless correctness checks and timings of
 //! the core operations on a very large image.
 
 use crate::composite::Pyramid;
@@ -235,7 +235,7 @@ fn check_history() {
     doc.redo();
     assert_eq!(doc.state.layers[0].surface.get_pixel(10, 10), [0, 0, 0, 255]);
     // ORA round trip
-    let dir = std::env::temp_dir().join("pinta-rs-selftest.ora");
+    let dir = std::env::temp_dir().join("patina-selftest.ora");
     crate::ops::add_layer(&mut doc);
     doc.state.layers[1].surface.set_pixel(5, 5, [10, 20, 30, 255]);
     doc.state.layers[1].opacity = 0.5;

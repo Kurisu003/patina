@@ -102,10 +102,12 @@ pub enum Skin {
 
 impl Skin {
     fn path() -> Option<PathBuf> {
-        std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config/pinta-rs/skin"))
+        std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config/patina/skin"))
     }
     fn load() -> Skin {
-        match Self::path().and_then(|p| std::fs::read_to_string(p).ok()).as_deref().map(str::trim) {
+        let old = std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config/pinta-rs/skin"));
+        let text = Self::path().and_then(|p| std::fs::read_to_string(p).ok()).or_else(|| old.and_then(|p| std::fs::read_to_string(p).ok()));
+        match text.as_deref().map(str::trim) {
             Some("classic") => Skin::Classic,
             _ => Skin::Pinta,
         }
@@ -510,16 +512,12 @@ impl App {
 }
 
 fn load_icons(ctx: &egui::Context) -> HashMap<String, egui::TextureHandle> {
+    mod embedded {
+        include!(concat!(env!("OUT_DIR"), "/icons.rs"));
+    }
     let mut out = HashMap::new();
-    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/icons");
-    let Ok(rd) = std::fs::read_dir(&dir) else { return out };
-    for e in rd.flatten() {
-        let p = e.path();
-        if p.extension().is_none_or(|x| x != "svg") {
-            continue;
-        }
-        let Ok(data) = std::fs::read(&p) else { continue };
-        let Ok(tree) = resvg::usvg::Tree::from_data(&data, &resvg::usvg::Options::default()) else { continue };
+    for &(stem, data) in embedded::ICONS {
+        let Ok(tree) = resvg::usvg::Tree::from_data(data, &resvg::usvg::Options::default()) else { continue };
         let Some(mut pm) = resvg::tiny_skia::Pixmap::new(ICON_PX, ICON_PX) else { continue };
         let s = tree.size();
         let sc = ICON_PX as f32 / s.width().max(s.height());
@@ -530,7 +528,7 @@ fn load_icons(ctx: &egui::Context) -> HashMap<String, egui::TextureHandle> {
             rgba.extend_from_slice(&[255, 255, 255, px[3]]);
         }
         let img = egui::ColorImage::from_rgba_unmultiplied([ICON_PX as usize, ICON_PX as usize], &rgba);
-        let name = p.file_stem().unwrap().to_string_lossy().trim_end_matches("-symbolic").to_string();
+        let name = stem.trim_end_matches("-symbolic").to_string();
         out.insert(name.clone(), ctx.load_texture(name, img, egui::TextureOptions::LINEAR));
     }
     out
@@ -2214,8 +2212,10 @@ impl App {
                 });
             }
             Dialog::About => {
-                egui::Window::new("About Pinta-rs").collapsible(false).resizable(false).anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO).order(egui::Order::Foreground).show(ctx, |ui| {
-                    ui.heading("Pinta-rs");
+                egui::Window::new("About Patina").collapsible(false).resizable(false).anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO).order(egui::Order::Foreground).show(ctx, |ui| {
+                    ui.heading("Patina");
+                    ui.label("By Daniel (Kurisu003). Licensed under CC BY-NC-SA 4.0.");
+                    ui.hyperlink("https://github.com/Kurisu003/patina");
                     ui.label("A Rust port of Pinta with a tiled, GPU-rendered canvas.");
                     ui.label("Based on Pinta (MIT License), which is based on Paint.NET 3.36 (MIT License).");
                     ui.label("Icons: Paint.NET (MIT), Silk and Fugue icon sets (CC BY 3.0), Pinta contributors (MIT).");
@@ -2591,7 +2591,7 @@ impl eframe::App for App {
                 self.shortcuts(&ctx);
             }
         }
-        let title = self.docs.get(self.active).map(|d| format!("{} - Pinta-rs", d.display_name())).unwrap_or_else(|| "Pinta-rs".into());
+        let title = self.docs.get(self.active).map(|d| format!("{} - Patina", d.display_name())).unwrap_or_else(|| "Patina".into());
         ctx.send_viewport_cmd(egui::ViewportCommand::Title(title));
 
         if self.skin_applied != Some(self.skin) {
