@@ -1787,6 +1787,8 @@ impl App {
         self.cursor = hover.filter(|h| rect.contains(*h)).map(to_img);
         self.tools.pick_radius = 7.0 / z;
         self.tools.view_zoom = z;
+        self.tools.held = (mods.shift, mods.command, mods.alt);
+        self.tools.view_layer = (doc.id, doc.state.layer().id);
         self.tools.tick(doc);
         let modal = !matches!(self.dialog, Dialog::None) || self.palette_edit.is_some();
         if self.job.is_none() && !modal {

@@ -293,6 +293,8 @@ pub struct KeyBindings {
     pub sel_intersect: ModKey,
     /// Clone stamp: set the source point.
     pub clone_source: ModKey,
+    /// Brushes: click draws a straight line from the last stroke's end.
+    pub line_from_last: ModKey,
 }
 
 impl Default for KeyBindings {
@@ -306,13 +308,14 @@ impl Default for KeyBindings {
             sel_add: ModKey::Ctrl,
             sel_intersect: ModKey::Alt,
             clone_source: ModKey::Ctrl,
+            line_from_last: ModKey::Shift,
         }
     }
 }
 
 impl KeyBindings {
     /// (config id, label, field) for every binding, for the UI and the config file.
-    pub fn entries(&mut self) -> [(&'static str, &'static str, &mut ModKey); 8] {
+    pub fn entries(&mut self) -> [(&'static str, &'static str, &mut ModKey); 9] {
         [
             ("key_proportional", "Keep proportions while resizing", &mut self.proportional),
             ("key_resize_center", "Resize from the center (Move Selected)", &mut self.resize_center),
@@ -322,6 +325,7 @@ impl KeyBindings {
             ("key_sel_add", "Add to selection", &mut self.sel_add),
             ("key_sel_intersect", "Intersect selection", &mut self.sel_intersect),
             ("key_clone_source", "Set clone stamp source", &mut self.clone_source),
+            ("key_line_from_last", "Brush: straight line from last point", &mut self.line_from_last),
         ]
     }
 }
@@ -768,6 +772,12 @@ struct WandLast {
 pub struct Tools {
     /// Modifier key assignments, set from the preferences.
     pub keys: KeyBindings,
+    /// End of the last brush stroke: (doc id, layer id, point), for Shift-click lines.
+    last_stroke_end: Option<(u64, u64, [f32; 2])>,
+    /// Current modifier state (set by the canvas each frame) for previews.
+    pub held: (bool, bool, bool),
+    /// (doc id, layer id) the canvas currently shows.
+    pub view_layer: (u64, u64),
     wand_last: Option<WandLast>,
     pub text: Option<TextEdit>,
     pub line: Option<LineEdit>,
@@ -807,6 +817,9 @@ impl Default for Tools {
     fn default() -> Self {
         Tools {
             keys: KeyBindings::default(),
+            last_stroke_end: None,
+            held: (false, false, false),
+            view_layer: (0, 0),
             wand_last: None,
             text: None,
             line: None,
@@ -946,7 +959,13 @@ impl Tools {
                     pixel,
                     hardness: if pixel { 1.0 } else { (s.hardness / 100.0).clamp(0.0, 1.0) },
                 };
-                st.segment(doc, p.pos, p.pos);
+                // Shift-click: straight line from where the last stroke ended
+                let from = match self.last_stroke_end {
+                    Some((d, l, pt)) if p.has(keys.line_from_last) && d == doc.id && l == doc.state.layer().id => pt,
+                    _ => p.pos,
+                };
+                st.segment(doc, from, p.pos);
+                st.last = p.pos;
                 self.active = Active::Stroke(st);
             }
             ToolKind::LineCurve => {
@@ -1323,7 +1342,8 @@ impl Tools {
         let mut req = ViewRequest::None;
         match active {
             Active::None => {}
-            Active::Stroke(_) => {
+            Active::Stroke(st) => {
+                self.last_stroke_end = Some((doc.id, doc.state.layer().id, st.last));
                 doc.commit(self.current.name());
                 if let Some(c) = [pal.primary].first() {
                     pal.touch(*c);
@@ -1520,6 +1540,22 @@ impl Tools {
         }
         if let Some(h) = self.hover {
             let c = to_screen(h);
+            // Shift-click line preview for brushes
+            let k = self.keys.line_from_last;
+            let held = match k {
+                ModKey::Shift => self.held.0,
+                ModKey::Ctrl => self.held.1,
+                ModKey::Alt => self.held.2,
+            };
+            if held && matches!(self.active, Active::None) && matches!(self.current, ToolKind::Paintbrush | ToolKind::Pencil | ToolKind::Eraser | ToolKind::CloneStamp | ToolKind::Recolor) {
+                if let Some((d, l, from)) = self.last_stroke_end {
+                    if (d, l) == self.view_layer {
+                        let a = to_screen(from);
+                        painter.line_segment([a, c], Stroke::new(3.0, Color32::from_black_alpha(120)));
+                        painter.line_segment([a, c], Stroke::new(1.0, Color32::from_white_alpha(220)));
+                    }
+                }
+            }
             if self.current.uses_brush_width() && !self.current.is_shape() && self.current != ToolKind::LineCurve {
                 let r = (self.settings.brush_width * zoom_pts / 2.0).max(2.0);
                 painter.circle_stroke(c, r, Stroke::new(2.0, Color32::from_black_alpha(140)));
