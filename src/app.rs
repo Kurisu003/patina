@@ -42,7 +42,7 @@ struct EffectJob {
 
 enum Dialog {
     None,
-    Preferences { w: u32, h: u32, bg: u8, skin: Skin },
+    Preferences { w: u32, h: u32, bg: u8, skin: Skin, keys: crate::tools::KeyBindings },
     /// Clipboard image: paste into the current image or open as a new one.
     PasteChoice { w: u32, h: u32, data: Arc<Vec<u8>>, fit: ops::PasteFit },
     /// Files dropped onto the window while an image is open.
@@ -143,6 +143,8 @@ struct Prefs {
     h: u32,
     /// 0 white, 1 secondary color, 2 transparent
     bg: u8,
+    /// Tool modifier keys.
+    keys: crate::tools::KeyBindings,
 }
 
 impl Prefs {
@@ -150,7 +152,7 @@ impl Prefs {
         std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config/patina/prefs"))
     }
     fn load() -> Prefs {
-        let mut p = Prefs { w: 800, h: 600, bg: 0 };
+        let mut p = Prefs { w: 800, h: 600, bg: 0, keys: Default::default() };
         let text = Self::path().and_then(|f| std::fs::read_to_string(f).ok()).unwrap_or_default();
         for line in text.lines() {
             let Some((k, v)) = line.split_once('=') else { continue };
@@ -159,7 +161,15 @@ impl Prefs {
                 "canvas_width" => p.w = v.parse().unwrap_or(p.w).clamp(1, 100_000),
                 "canvas_height" => p.h = v.parse().unwrap_or(p.h).clamp(1, 100_000),
                 "canvas_background" => p.bg = v.parse().unwrap_or(p.bg).min(2),
-                _ => {}
+                k => {
+                    for (id, _, slot) in p.keys.entries() {
+                        if id == k {
+                            if let Some(m) = crate::tools::ModKey::from_id(v) {
+                                *slot = m;
+                            }
+                        }
+                    }
+                }
             }
         }
         p
@@ -167,7 +177,12 @@ impl Prefs {
     fn save(self) {
         if let Some(f) = Self::path() {
             let _ = std::fs::create_dir_all(f.parent().unwrap());
-            let _ = std::fs::write(f, format!("canvas_width={}\ncanvas_height={}\ncanvas_background={}\n", self.w, self.h, self.bg));
+            let mut text = format!("canvas_width={}\ncanvas_height={}\ncanvas_background={}\n", self.w, self.h, self.bg);
+            let mut keys = self.keys;
+            for (id, _, m) in keys.entries() {
+                text.push_str(&format!("{id}={}\n", m.id()));
+            }
+            let _ = std::fs::write(f, text);
         }
     }
 }
@@ -275,6 +290,13 @@ impl App {
             palette_edit: None,
             script: std::env::var("PINTA_SCRIPT").ok().and_then(|p| crate::script::Script::load(&p)),
         };
+        app.tools.keys = app.prefs.keys;
+        if let Some(w) = cc.storage.and_then(|st| st.get_string("classic_windows")) {
+            let f: Vec<bool> = w.chars().map(|c| c == '1').collect();
+            if f.len() == 4 {
+                (app.win_tools, app.win_history, app.win_layers, app.win_colors) = (f[0], f[1], f[2], f[3]);
+            }
+        }
         for f in files {
             app.open_path(f);
         }
@@ -1048,7 +1070,7 @@ impl App {
                 ui.separator();
                 if ui.button("Preferences...").clicked() {
                     let p = self.prefs;
-                    self.dialog = Dialog::Preferences { w: p.w, h: p.h, bg: p.bg, skin: self.skin };
+                    self.dialog = Dialog::Preferences { w: p.w, h: p.h, bg: p.bg, skin: self.skin, keys: p.keys };
                 }
             });
             ui.menu_button("View", |ui| {
@@ -1412,7 +1434,13 @@ impl App {
                 }
             }
             if t == ToolKind::MoveSelected {
-                ui.label("Drag moves · handles or Shift+drag resize (Alt keeps proportions) · right drag rotates (Shift snaps)");
+                let k = self.tools.keys;
+                ui.label(format!(
+                    "Drag moves · handles or {}+drag resize ({} keeps proportions) · right drag rotates ({} snaps)",
+                    k.resize_center.name(),
+                    k.proportional.name(),
+                    k.snap.name()
+                ));
             }
         });
     }
@@ -1936,7 +1964,7 @@ impl App {
         let mut act: Option<Box<dyn FnOnce(&mut App)>> = None;
         match &mut self.dialog {
             Dialog::None => {}
-            Dialog::Preferences { w, h, bg, skin } => {
+            Dialog::Preferences { w, h, bg, skin, keys } => {
                 egui::Window::new("Preferences").collapsible(false).resizable(false).anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO).order(egui::Order::Foreground).show(ctx, |ui| {
                     ui.strong("Appearance");
                     ui.horizontal(|ui| {
@@ -1972,17 +2000,36 @@ impl App {
                         }
                     });
                     ui.separator();
+                    ui.strong("Modifier keys");
+                    ui.weak("Hold these while dragging with a tool.");
+                    ui.add_space(4.0);
+                    egui::Grid::new("prefkeys").num_columns(2).spacing([12.0, 4.0]).show(ui, |ui| {
+                        for (id, label, slot) in keys.entries() {
+                            ui.label(label);
+                            egui::ComboBox::from_id_salt(id).width(70.0).selected_text(slot.name()).show_ui(ui, |ui| {
+                                for m in crate::tools::ModKey::ALL {
+                                    ui.selectable_value(slot, m, m.name());
+                                }
+                            });
+                            ui.end_row();
+                        }
+                    });
+                    if ui.small_button("Reset keys to defaults").clicked() {
+                        *keys = Default::default();
+                    }
+                    ui.separator();
                     ui.horizontal(|ui| {
                         if ui.button("Cancel").clicked() {
                             close = true;
                         }
                         if ui.add(egui::Button::new("Save").fill(ui.visuals().selection.bg_fill)).clicked() {
-                            let p = Prefs { w: *w, h: *h, bg: *bg };
+                            let p = Prefs { w: *w, h: *h, bg: *bg, keys: *keys };
                             let sk = *skin;
                             act = Some(Box::new(move |app: &mut App| {
                                 app.prefs = p;
                                 p.save();
                                 app.skin = sk;
+                                app.tools.keys = p.keys;
                             }));
                             close = true;
                         }
@@ -2681,6 +2728,13 @@ fn checker(p: &egui::Painter, r: Rect) {
 }
 
 impl eframe::App for App {
+    /// egui memory (floating window positions) is saved by eframe; this adds
+    /// which Classic windows are open.
+    fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        let b = |v: bool| if v { '1' } else { '0' };
+        storage.set_string("classic_windows", [b(self.win_tools), b(self.win_history), b(self.win_layers), b(self.win_colors)].iter().collect());
+    }
+
     fn raw_input_hook(&mut self, ctx: &egui::Context, raw: &mut egui::RawInput) {
         if let Some(s) = self.script.as_mut() {
             s.step(ctx, raw);

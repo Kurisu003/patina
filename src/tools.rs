@@ -245,6 +245,97 @@ impl Default for ToolSettings {
     }
 }
 
+/// A modifier key the user can assign to a tool action.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ModKey {
+    Shift,
+    Ctrl,
+    Alt,
+}
+
+impl ModKey {
+    pub const ALL: [ModKey; 3] = [ModKey::Shift, ModKey::Ctrl, ModKey::Alt];
+    pub fn name(self) -> &'static str {
+        match self {
+            ModKey::Shift => "Shift",
+            ModKey::Ctrl => "Ctrl",
+            ModKey::Alt => "Alt",
+        }
+    }
+    pub fn id(self) -> &'static str {
+        match self {
+            ModKey::Shift => "shift",
+            ModKey::Ctrl => "ctrl",
+            ModKey::Alt => "alt",
+        }
+    }
+    pub fn from_id(s: &str) -> Option<ModKey> {
+        ModKey::ALL.into_iter().find(|m| m.id() == s)
+    }
+}
+
+/// Which modifier triggers which tool behaviour (Edit > Preferences).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct KeyBindings {
+    /// Keep width/height proportional while resizing a selection.
+    pub proportional: ModKey,
+    /// Drag inside Move Selected to resize around the centre.
+    pub resize_center: ModKey,
+    /// Snap angles (rotation, lines, gradients, line points).
+    pub snap: ModKey,
+    /// Square / circle for shapes and rectangle/ellipse selections.
+    pub square: ModKey,
+    /// Magic wand / paint bucket fill the whole image (global).
+    pub global_fill: ModKey,
+    /// Add to the selection (with right click: XOR).
+    pub sel_add: ModKey,
+    /// Intersect with the selection.
+    pub sel_intersect: ModKey,
+    /// Clone stamp: set the source point.
+    pub clone_source: ModKey,
+}
+
+impl Default for KeyBindings {
+    fn default() -> Self {
+        KeyBindings {
+            proportional: ModKey::Alt,
+            resize_center: ModKey::Shift,
+            snap: ModKey::Shift,
+            square: ModKey::Shift,
+            global_fill: ModKey::Shift,
+            sel_add: ModKey::Ctrl,
+            sel_intersect: ModKey::Alt,
+            clone_source: ModKey::Ctrl,
+        }
+    }
+}
+
+impl KeyBindings {
+    /// (config id, label, field) for every binding, for the UI and the config file.
+    pub fn entries(&mut self) -> [(&'static str, &'static str, &mut ModKey); 8] {
+        [
+            ("key_proportional", "Keep proportions while resizing", &mut self.proportional),
+            ("key_resize_center", "Resize from the center (Move Selected)", &mut self.resize_center),
+            ("key_snap", "Snap angles (rotate, lines, gradient)", &mut self.snap),
+            ("key_square", "Square / circle shapes and selections", &mut self.square),
+            ("key_global_fill", "Global fill (magic wand, paint bucket)", &mut self.global_fill),
+            ("key_sel_add", "Add to selection", &mut self.sel_add),
+            ("key_sel_intersect", "Intersect selection", &mut self.sel_intersect),
+            ("key_clone_source", "Set clone stamp source", &mut self.clone_source),
+        ]
+    }
+}
+
+impl Pointer {
+    pub fn has(&self, m: ModKey) -> bool {
+        match m {
+            ModKey::Shift => self.shift,
+            ModKey::Ctrl => self.ctrl,
+            ModKey::Alt => self.alt,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct Pointer {
     /// Image coordinates.
@@ -619,7 +710,7 @@ impl MoveSelectedState {
         self.scale == [1.0, 1.0]
     }
     /// Pick the drag mode for a new press.
-    fn begin(&mut self, p: &Pointer, pick: f32) {
+    fn begin(&mut self, p: &Pointer, pick: f32, center_key: bool) {
         let b = self.bx();
         self.start = [p.pos[0] - self.offset[0], p.pos[1] - self.offset[1]];
         self.rot_start = (p.pos[1] - b.c[1]).atan2(p.pos[0] - b.c[0]) - self.angle;
@@ -630,7 +721,7 @@ impl MoveSelectedState {
             MsMode::Rotate
         } else if let Some((hx, hy)) = hit {
             MsMode::Handle { hx, hy, anchor: b.point(-hx as f32, -hy as f32), s0: self.scale }
-        } else if p.shift {
+        } else if center_key {
             MsMode::Center { s0: self.scale, d0: rot([p.pos[0] - b.c[0], p.pos[1] - b.c[1]], -self.angle) }
         } else {
             MsMode::Move
@@ -675,6 +766,8 @@ struct WandLast {
 }
 
 pub struct Tools {
+    /// Modifier key assignments, set from the preferences.
+    pub keys: KeyBindings,
     wand_last: Option<WandLast>,
     pub text: Option<TextEdit>,
     pub line: Option<LineEdit>,
@@ -713,6 +806,7 @@ pub enum ViewRequest {
 impl Default for Tools {
     fn default() -> Self {
         Tools {
+            keys: KeyBindings::default(),
             wand_last: None,
             text: None,
             line: None,
@@ -735,8 +829,8 @@ impl Default for Tools {
     }
 }
 
-fn combine_mode_for(p: &Pointer, default: CombineMode) -> CombineMode {
-    match (p.ctrl, p.secondary, p.alt) {
+fn combine_mode_for(p: &Pointer, k: &KeyBindings, default: CombineMode) -> CombineMode {
+    match (p.has(k.sel_add), p.secondary, p.has(k.sel_intersect)) {
         (true, true, _) => CombineMode::Xor,
         (true, false, _) => CombineMode::Union,
         (false, true, _) => CombineMode::Exclude,
@@ -815,6 +909,7 @@ impl Tools {
     }
 
     pub fn press(&mut self, doc: &mut Document, pal: &mut Palette, p: Pointer) -> ViewRequest {
+        let keys = self.keys;
         let s = &self.settings;
         let (w, h) = (doc.state.width, doc.state.height);
         let primary = if p.secondary { pal.secondary } else { pal.primary };
@@ -824,7 +919,7 @@ impl Tools {
                 let kind = match self.current {
                     ToolKind::Eraser => StrokeKind::Erase,
                     ToolKind::CloneStamp => {
-                        if p.ctrl {
+                        if p.has(keys.clone_source) {
                             self.clone_source = Some((doc.state.layer().id, p.pos));
                             self.clone_offset = None;
                             self.status = format!("Clone source set at {:.0}, {:.0}", p.pos[0], p.pos[1]);
@@ -901,15 +996,15 @@ impl Tools {
                 });
             }
             ToolKind::RectangleSelect | ToolKind::EllipseSelect => {
-                let mode = combine_mode_for(&p, s.sel_mode);
+                let mode = combine_mode_for(&p, &keys, s.sel_mode);
                 self.active = Active::SelectShape { start: p.pos, end: p.pos, base: doc.state.selection.clone(), mode };
             }
             ToolKind::LassoSelect => {
-                let mode = combine_mode_for(&p, s.sel_mode);
+                let mode = combine_mode_for(&p, &keys, s.sel_mode);
                 self.active = Active::Lasso { points: vec![p.pos], base: doc.state.selection.clone(), mode };
             }
             ToolKind::MagicWand => {
-                let mode = combine_mode_for(&p, s.sel_mode);
+                let mode = combine_mode_for(&p, &keys, s.sel_mode);
                 let (x, y) = (p.pos[0].floor() as i32, p.pos[1].floor() as i32);
                 if x < 0 || y < 0 || x >= w as i32 || y >= h as i32 {
                     return ViewRequest::None;
@@ -919,11 +1014,11 @@ impl Tools {
                     SampleFrom::Image => flatten(doc),
                 };
                 let t0 = std::time::Instant::now();
-                let m = fill_mask(&src, x, y, s.tolerance, s.flood_global || p.shift, &Selection::default());
+                let m = fill_mask(&src, x, y, s.tolerance, s.flood_global || p.has(keys.global_fill), &Selection::default());
                 let base = doc.state.selection.clone();
                 apply_selection(doc, &base, m, mode);
                 doc.commit("Magic Wand Select");
-                self.wand_last = Some(WandLast { doc_id: doc.id, history_pos: doc.history_pos, at: (x, y), base, mode, shift: p.shift, sig: (s.tolerance.to_bits(), s.flood_global, s.wand_from) });
+                self.wand_last = Some(WandLast { doc_id: doc.id, history_pos: doc.history_pos, at: (x, y), base, mode, shift: p.has(keys.global_fill), sig: (s.tolerance.to_bits(), s.flood_global, s.wand_from) });
                 self.status = format!("Magic wand: {:.0} ms", t0.elapsed().as_secs_f32() * 1000.0);
             }
             ToolKind::PaintBucket => {
@@ -935,7 +1030,7 @@ impl Tools {
                     return ViewRequest::None;
                 }
                 let base = doc.state.layer().surface.clone();
-                let m = fill_mask(&base, x, y, s.tolerance, s.flood_global || p.shift, &doc.state.selection);
+                let m = fill_mask(&base, x, y, s.tolerance, s.flood_global || p.has(keys.global_fill), &doc.state.selection);
                 let col = premul(primary);
                 let blend = s.alpha_blending;
                 let r = m.bounds().unwrap_or_default();
@@ -972,7 +1067,7 @@ impl Tools {
                 // continue moving the still-floating pixels if nothing else touched the layer
                 if let Some((key, mut ms)) = self.floating.take() {
                     if key == floating_key(doc) {
-                        ms.begin(&p, self.pick_radius * 1.3);
+                        ms.begin(&p, self.pick_radius * 1.3, p.has(keys.resize_center));
                         self.active = Active::MoveSelected(ms);
                         return ViewRequest::None;
                     }
@@ -1024,7 +1119,7 @@ impl Tools {
                     rot_start: 0.0,
                     mask_local: std::sync::OnceLock::new(),
                 });
-                ms.begin(&p, self.pick_radius * 1.3);
+                ms.begin(&p, self.pick_radius * 1.3, p.has(keys.resize_center));
                 self.active = Active::MoveSelected(ms);
             }
             ToolKind::Pan => self.active = Active::Pan { last: p.screen },
@@ -1058,6 +1153,7 @@ impl Tools {
 
     pub fn drag(&mut self, doc: &mut Document, pal: &mut Palette, p: Pointer) -> ViewRequest {
         self.hover = Some(p.pos);
+        let keys = self.keys;
         let s = &self.settings;
         let current = self.current;
         let mut req = ViewRequest::None;
@@ -1069,7 +1165,8 @@ impl Tools {
                 st.segment(doc, a, p.pos);
             }
             Active::Shape(sh) => {
-                sh.end = if p.shift {
+                let held = if current == ToolKind::LineCurve { p.has(keys.snap) } else { p.has(keys.square) };
+                sh.end = if held {
                     if current == ToolKind::LineCurve { snap_angle(sh.start, p.pos) } else { constrain_square(sh.start, p.pos) }
                 } else {
                     p.pos
@@ -1080,7 +1177,7 @@ impl Tools {
                 render_shape(doc, current, sh, s);
             }
             Active::SelectShape { start, end, base, mode } => {
-                *end = if p.shift { constrain_square(*start, p.pos) } else { p.pos };
+                *end = if p.has(keys.square) { constrain_square(*start, p.pos) } else { p.pos };
                 let (w, h) = (doc.state.width, doc.state.height);
                 let r = rect_of(*start, *end);
                 let m = if current == ToolKind::EllipseSelect {
@@ -1123,7 +1220,7 @@ impl Tools {
                     MsMode::Rotate => {
                         let c = ms.bx().c;
                         let mut a = (p.pos[1] - c[1]).atan2(p.pos[0] - c[0]) - ms.rot_start;
-                        if p.shift {
+                        if p.has(keys.snap) {
                             let step = std::f32::consts::PI / 12.0;
                             a = (a / step).round() * step;
                         }
@@ -1139,7 +1236,7 @@ impl Tools {
                         let d = rot([p.pos[0] - anchor[0], p.pos[1] - anchor[1]], -ms.angle);
                         let (fx, fy) = (hx as f32, hy as f32);
                         let mut sc = s0;
-                        if p.alt {
+                        if p.has(keys.proportional) {
                             // keep proportions: project onto the handle's original direction
                             let h = [fx * s0[0] * w0, fy * s0[1] * h0];
                             let k = (d[0] * h[0] + d[1] * h[1]) / (h[0] * h[0] + h[1] * h[1]).max(1e-6);
@@ -1164,7 +1261,7 @@ impl Tools {
                         let c = ms.bx().c;
                         let d = rot([p.pos[0] - c[0], p.pos[1] - c[1]], -ms.angle);
                         let half0 = [s0[0].abs() * w0 / 2.0, s0[1].abs() * h0 / 2.0];
-                        let k = if p.alt {
+                        let k = if p.has(keys.proportional) {
                             let l = (half0[0] * half0[0] + half0[1] * half0[1]).sqrt().max(1.0);
                             let g = (d[0] * d[0] + d[1] * d[1]).sqrt() - (d0[0] * d0[0] + d0[1] * d0[1]).sqrt();
                             let kk = ((l + g) / l).max(0.0);
@@ -1191,7 +1288,7 @@ impl Tools {
                 );
             }
             Active::Gradient { base, start, end, swap } => {
-                *end = if p.shift { snap_angle(*start, p.pos) } else { p.pos };
+                *end = if p.has(keys.snap) { snap_angle(*start, p.pos) } else { p.pos };
                 let (c0, c1) = if *swap { (pal.secondary, pal.primary) } else { (pal.primary, pal.secondary) };
                 render_gradient(doc, base, *start, *end, c0, c1, s);
             }
@@ -1205,7 +1302,7 @@ impl Tools {
                 let idx = *idx;
                 if let Some(le) = self.line.as_mut() {
                     let mut q = p.pos;
-                    if p.shift && idx > 0 {
+                    if p.has(keys.snap) && idx > 0 {
                         q = snap_angle(le.sh.points[idx - 1], q);
                     }
                     if let Some(pt) = le.sh.points.get_mut(idx) {

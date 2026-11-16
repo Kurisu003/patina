@@ -56,7 +56,9 @@ Some timings on a 400 MP (20000 x 20000) image: brush stroke segment 0.2 ms, mag
   - Paste or drop an image and choose: into this image, a new layer or a new tab,
     and whether to expand the canvas, keep it, or fit to its width or height.
   - Outline Object can use custom outline and gradient colors instead of the palette.
-  - Edit > Preferences: default canvas size and background for new images and startup.
+  - Edit > Preferences: default canvas size and background, skin, and which modifier key
+    (Shift / Ctrl / Alt) does what (keep proportions, snap angles, square shapes, global fill, ...).
+  - Floating windows and the main window remember their positions and size.
   - Optional **Classic** skin (View > Skin or Edit > Preferences) in Paint.NET light or dark, floating Tools / History /
     Layers / Colors windows (F5-F8) and a color wheel, for people used to Paint.NET.
 

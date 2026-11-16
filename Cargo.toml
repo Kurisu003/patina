@@ -1,6 +1,6 @@
 [package]
 name = "patina"
-version = "0.1.4"
+version = "0.1.5"
 edition = "2024"
 description = "A fast, GPU-rendered image editor in Rust, ported from Pinta"
 license-file = "LICENSE"
@@ -10,7 +10,7 @@ build = "build.rs"
 [dependencies]
 ab_glyph = "0.2"
 arboard = { version = "3", features = ["wayland-data-control"] }
-eframe = { version = "0.37", default-features = false, features = ["wgpu", "default_fonts", "wayland", "x11"] }
+eframe = { version = "0.37", default-features = false, features = ["wgpu", "default_fonts", "wayland", "x11", "persistence"] }
 egui-wgpu = "0.37"
 image = "0.25"
 quick-xml = "0.42"
