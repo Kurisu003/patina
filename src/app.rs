@@ -66,6 +66,13 @@ pub struct App {
     last_effect: Option<usize>,
     dialog: Dialog,
     show_grid: bool,
+    skin: Skin,
+    skin_applied: Option<Skin>,
+    win_tools: bool,
+    win_history: bool,
+    win_layers: bool,
+    win_colors: bool,
+    color_target_primary: bool,
     error: Option<String>,
     start: Instant,
     drag: Option<bool>,
@@ -79,6 +86,51 @@ pub struct App {
     quit_confirmed: bool,
     palette_edit: Option<bool>,
     script: Option<crate::script::Script>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Skin {
+    /// Pinta's docked layout.
+    Pinta,
+    /// Paint.NET-style layout: light theme, floating tool windows.
+    Classic,
+}
+
+impl Skin {
+    fn path() -> Option<PathBuf> {
+        std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config/pinta-rs/skin"))
+    }
+    fn load() -> Skin {
+        match Self::path().and_then(|p| std::fs::read_to_string(p).ok()).as_deref().map(str::trim) {
+            Some("classic") => Skin::Classic,
+            _ => Skin::Pinta,
+        }
+    }
+    fn save(self) {
+        if let Some(p) = Self::path() {
+            let _ = std::fs::create_dir_all(p.parent().unwrap());
+            let _ = std::fs::write(p, if self == Skin::Classic { "classic" } else { "pinta" });
+        }
+    }
+}
+
+fn classic_visuals() -> egui::Visuals {
+    let mut v = egui::Visuals::light();
+    let accent = Color32::from_rgb(51, 153, 255);
+    v.panel_fill = Color32::from_rgb(234, 239, 247);
+    v.window_fill = Color32::from_rgb(246, 248, 252);
+    v.extreme_bg_color = Color32::from_rgb(207, 215, 230);
+    v.faint_bg_color = Color32::from_rgb(240, 243, 249);
+    v.selection.bg_fill = accent;
+    v.selection.stroke = egui::Stroke::new(1.0, Color32::WHITE);
+    v.hyperlink_color = accent;
+    v.window_stroke = egui::Stroke::new(1.0, Color32::from_rgb(160, 175, 200));
+    v.window_corner_radius = egui::CornerRadius::same(4);
+    v.widgets.inactive.weak_bg_fill = Color32::from_rgb(225, 231, 241);
+    v.widgets.hovered.weak_bg_fill = Color32::from_rgb(204, 228, 252);
+    v.widgets.hovered.bg_stroke = egui::Stroke::new(1.0, accent);
+    v.widgets.active.weak_bg_fill = Color32::from_rgb(170, 210, 250);
+    v
 }
 
 fn default_palette() -> Vec<[u8; 4]> {
@@ -121,6 +173,13 @@ impl App {
             last_effect: None,
             dialog: Dialog::None,
             show_grid: false,
+            skin: Skin::load(),
+            skin_applied: None,
+            win_tools: true,
+            win_history: true,
+            win_layers: true,
+            win_colors: true,
+            color_target_primary: true,
             error: None,
             start: Instant::now(),
             drag: None,
@@ -899,6 +958,10 @@ impl App {
                 }
                 ui.separator();
                 ui.checkbox(&mut self.show_grid, "Pixel Grid");
+                ui.separator();
+                ui.label("Skin");
+                ui.radio_value(&mut self.skin, Skin::Pinta, "Pinta");
+                ui.radio_value(&mut self.skin, Skin::Classic, "Classic (Paint.NET-style)");
             });
             ui.menu_button("Image", |ui| {
                 if ui.add(egui::Button::new("Crop to Selection").shortcut_text("Ctrl+Shift+X")).clicked() {
@@ -993,6 +1056,17 @@ impl App {
                     });
                 }
             });
+            if self.skin == Skin::Classic {
+                ui.menu_button("Window", |ui| {
+                    ui.checkbox(&mut self.win_tools, "Tools  (F5)");
+                    ui.checkbox(&mut self.win_history, "History  (F6)");
+                    ui.checkbox(&mut self.win_layers, "Layers  (F7)");
+                    ui.checkbox(&mut self.win_colors, "Colors  (F8)");
+                    if ui.button("Reset Window Positions").clicked() {
+                        ui.ctx().memory_mut(|m| m.reset_areas());
+                    }
+                });
+            }
             ui.menu_button("Help", |ui| {
                 if ui.button("About").clicked() {
                     self.dialog = Dialog::About;
@@ -1446,9 +1520,10 @@ impl App {
             }
             _ => {}
         }
-        ui.separator();
-        ui.heading("History");
-        let d = &mut self.docs[self.active];
+    }
+
+    fn history_panel(&mut self, ui: &mut egui::Ui) {
+        let Some(d) = self.docs.get_mut(self.active) else { return };
         let mut goto = None;
         egui::ScrollArea::vertical().id_salt("history").stick_to_bottom(true).show(ui, |ui| {
             for (i, h) in d.history.iter().enumerate() {
@@ -1508,7 +1583,7 @@ impl App {
         // ---- input ----
         let (scroll, zoom_delta, mods, hover, pressed_mid, mid_down) = ui.input(|i| (i.smooth_scroll_delta, i.zoom_delta(), i.modifiers, i.pointer.hover_pos(), i.pointer.button_pressed(egui::PointerButton::Middle), i.pointer.middle_down()));
         let space = ui.input(|i| i.key_down(Key::Space)) && !ui.ctx().egui_wants_keyboard_input();
-        let over_canvas = hover.is_some_and(|h| rect.contains(h));
+        let over_canvas = hover.is_some_and(|h| rect.contains(h)) && resp.contains_pointer();
         let zp = |doc: &Document| doc.view.zoom / ppp;
         if over_canvas {
             if zoom_delta != 1.0 || (mods.command && scroll.y != 0.0) {
@@ -2066,6 +2141,241 @@ fn anchor_icon(cell: u8, anchor: u8) -> Option<&'static str> {
     })
 }
 
+impl App {
+    /// Paint.NET-style layout: menu + image strip, toolbar rows, full-size
+    /// canvas, floating Tools / History / Layers / Colors windows.
+    fn classic_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        if matches!(self.dialog, Dialog::None) && !ctx.egui_wants_keyboard_input() {
+            let mut toggle = |k: Key, b: &mut bool| {
+                if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, k)) {
+                    *b = !*b;
+                }
+            };
+            toggle(Key::F5, &mut self.win_tools);
+            toggle(Key::F6, &mut self.win_history);
+            toggle(Key::F7, &mut self.win_layers);
+            toggle(Key::F8, &mut self.win_colors);
+        }
+        egui::Panel::top("c_menu").show(ui, |ui| {
+            ui.horizontal(|ui| {
+                self.menu_bar(ui);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| self.image_strip(ui));
+            });
+        });
+        egui::Panel::top("c_toolbar").show(ui, |ui| {
+            ui.horizontal(|ui| {
+                let b = |ui: &mut egui::Ui, t: &str, tip: &str| ui.add(egui::Button::new(t).small()).on_hover_text(tip).clicked();
+                if b(ui, "New", "New image (Ctrl+N)") {
+                    self.dialog = Dialog::NewImage { w: 800, h: 600, bg: 0 };
+                }
+                if b(ui, "Open", "Open (Ctrl+O)") {
+                    self.open_dialog();
+                }
+                if b(ui, "Save", "Save (Ctrl+S)") {
+                    self.save(false);
+                }
+                ui.separator();
+                if b(ui, "Cut", "Cut (Ctrl+X)") {
+                    self.copy(false, true);
+                }
+                if b(ui, "Copy", "Copy (Ctrl+C)") {
+                    self.copy(false, false);
+                }
+                if b(ui, "Paste", "Paste (Ctrl+V)") {
+                    self.paste(0);
+                }
+                ui.separator();
+                let tools = &mut self.tools;
+                if let Some(d) = self.docs.get_mut(self.active) {
+                    if ui.add_enabled(d.can_undo(), egui::Button::new("Undo").small()).on_hover_text("Undo (Ctrl+Z)").clicked() {
+                        if tools.is_busy() { tools.cancel(d) } else { d.undo() }
+                    }
+                    if ui.add_enabled(d.can_redo(), egui::Button::new("Redo").small()).on_hover_text("Redo (Ctrl+Y)").clicked() {
+                        d.redo();
+                    }
+                    ui.separator();
+                    if ui.add(egui::Button::new("Deselect").small()).on_hover_text("Deselect All (Ctrl+Shift+A)").clicked() {
+                        ops::deselect(d);
+                    }
+                    if ui.add(egui::Button::new("Crop").small()).on_hover_text("Crop to Selection (Ctrl+Shift+X)").clicked() {
+                        ops::crop_to_selection(d);
+                    }
+                }
+                ui.separator();
+                ui.checkbox(&mut self.show_grid, "Pixel grid");
+            });
+        });
+        egui::Panel::top("c_options").show(ui, |ui| self.toolbar(ui));
+        egui::Panel::bottom("c_status").show(ui, |ui| self.status_bar(ui));
+        egui::CentralPanel::default().frame(egui::Frame::new()).show(ui, |ui| self.canvas(ui));
+
+        let area = self.canvas_rect;
+        if !area.is_positive() {
+            return;
+        }
+        let m = 10.0;
+        let mut open = self.win_tools;
+        egui::Window::new("Tools").id(egui::Id::new("c_tools")).open(&mut open).auto_sized().collapsible(false).default_pos(area.left_top() + Vec2::new(m, m)).show(ctx, |ui| self.toolbox(ui));
+        self.win_tools = open;
+        let mut open = self.win_history;
+        egui::Window::new("History").id(egui::Id::new("c_history")).open(&mut open).collapsible(false).default_size([200.0, 230.0]).default_pos(area.right_top() + Vec2::new(-210.0 - m, m)).show(ctx, |ui| self.history_panel(ui));
+        self.win_history = open;
+        let mut open = self.win_layers;
+        egui::Window::new("Layers").id(egui::Id::new("c_layers")).open(&mut open).collapsible(false).default_size([230.0, 260.0]).default_pos(area.right_bottom() + Vec2::new(-240.0 - m, -300.0 - m)).show(ctx, |ui| self.layers_panel(ui));
+        self.win_layers = open;
+        let mut open = self.win_colors;
+        egui::Window::new("Colors").id(egui::Id::new("c_colors")).open(&mut open).auto_sized().collapsible(false).default_pos(area.left_bottom() + Vec2::new(m, -265.0 - m)).show(ctx, |ui| self.colors_window(ui));
+        self.win_colors = open;
+    }
+
+    /// Thumbnails of open images, newest right, click to switch.
+    fn image_strip(&mut self, ui: &mut egui::Ui) {
+        let mut switch = None;
+        let mut close = None;
+        for i in (0..self.docs.len()).rev() {
+            let d = &self.docs[i];
+            let l = &d.state.layers[0];
+            let key = Arc::as_ptr(&l.surface.tiles) as usize;
+            let tex = match self.thumbs.get(&l.id) {
+                Some((k, t)) if *k == key => t.clone(),
+                _ => {
+                    let (tw, th, data) = ops::layer_thumbnail(&l.surface, 40);
+                    let img = egui::ColorImage::from_rgba_unmultiplied([tw as usize, th as usize], &data);
+                    let t = ui.ctx().load_texture(format!("thumb{}", l.id), img, egui::TextureOptions::LINEAR);
+                    self.thumbs.insert(l.id, (key, t.clone()));
+                    t
+                }
+            };
+            let sz = tex.size_vec2();
+            let sc = 28.0 / sz.x.max(sz.y);
+            let r = ui.add(egui::Button::image(egui::Image::new((tex.id(), sz * sc))).selected(i == self.active)).on_hover_text(d.display_name());
+            if r.clicked() {
+                switch = Some(i);
+            }
+            if r.middle_clicked() {
+                close = Some(i);
+            }
+        }
+        if let Some(i) = switch {
+            self.active = i;
+        }
+        if let Some(i) = close {
+            self.close_doc(i, false);
+        }
+    }
+
+    fn colors_window(&mut self, ui: &mut egui::Ui) {
+        use crate::effects::util::{hsv_to_rgb, rgb_to_hsv};
+        ui.set_max_width(320.0);
+        let target = if self.color_target_primary { self.palette.primary } else { self.palette.secondary };
+        let (h, s, v) = rgb_to_hsv(target[0], target[1], target[2]);
+        let mut new = target;
+        ui.horizontal(|ui| {
+            // HSV wheel
+            let size = 150.0;
+            let (rect, resp) = ui.allocate_exact_size(Vec2::splat(size), Sense::click_and_drag());
+            let c = rect.center();
+            let rad = size / 2.0 - 3.0;
+            let mut mesh = egui::Mesh::default();
+            let vc = |hh: f64, ss: f64| {
+                let (r, g, b) = hsv_to_rgb(hh, ss, 100.0);
+                Color32::from_rgb(r, g, b)
+            };
+            mesh.colored_vertex(c, vc(0.0, 0.0));
+            let n = 90;
+            for i in 0..=n {
+                let a = i as f32 / n as f32 * std::f32::consts::TAU;
+                mesh.colored_vertex(c + Vec2::new(a.cos(), -a.sin()) * rad, vc(a.to_degrees() as f64, 100.0));
+                if i > 0 {
+                    mesh.add_triangle(0, i as u32, i as u32 + 1);
+                }
+            }
+            ui.painter().add(egui::Shape::mesh(mesh));
+            ui.painter().circle_stroke(c, rad, (1.0, ui.visuals().weak_text_color()));
+            let ha = (h as f32).to_radians();
+            let mp = c + Vec2::new(ha.cos(), -ha.sin()) * rad * (s as f32 / 100.0);
+            ui.painter().circle_stroke(mp, 5.0, (2.0, Color32::BLACK));
+            ui.painter().circle_stroke(mp, 4.0, (1.0, Color32::WHITE));
+            if let Some(p) = resp.interact_pointer_pos() {
+                if resp.dragged() || resp.clicked() {
+                    let d = p - c;
+                    let hue = (-d.y).atan2(d.x).to_degrees().rem_euclid(360.0) as f64;
+                    let sat = ((d.length() / rad).min(1.0) * 100.0) as f64;
+                    let vv = if v < 1.0 { 100.0 } else { v };
+                    let (r, g, b) = hsv_to_rgb(hue, sat, vv);
+                    new = [r, g, b, target[3]];
+                }
+            }
+            ui.vertical(|ui| {
+                // primary/secondary swatches pick which colour the wheel edits
+                ui.horizontal(|ui| {
+                    for (primary, col, label) in [(true, self.palette.primary, "Primary"), (false, self.palette.secondary, "Secondary")] {
+                        let (r, resp) = ui.allocate_exact_size(Vec2::new(34.0, 34.0), Sense::click());
+                        checker(ui.painter(), r);
+                        ui.painter().rect_filled(r, 2.0, c32(col));
+                        let sel = self.color_target_primary == primary;
+                        ui.painter().rect_stroke(r, 2.0, (if sel { 3.0 } else { 1.0 }, if sel { ui.visuals().selection.bg_fill } else { Color32::GRAY }), egui::StrokeKind::Inside);
+                        if resp.on_hover_text(label).clicked() {
+                            self.color_target_primary = primary;
+                        }
+                    }
+                    if self.icon_small(ui, "edit-swap-vert", "Swap colors (X)").clicked() {
+                        std::mem::swap(&mut self.palette.primary, &mut self.palette.secondary);
+                    }
+                });
+                ui.label(if self.color_target_primary { "Editing primary" } else { "Editing secondary" });
+                let mut vv = v;
+                ui.horizontal(|ui| {
+                    ui.label("Value");
+                    if ui.add(egui::Slider::new(&mut vv, 0.0..=100.0).show_value(false)).changed() {
+                        let (r, g, b) = hsv_to_rgb(h, s, vv);
+                        new = [r, g, b, new[3]];
+                    }
+                });
+                let mut a = new[3];
+                ui.horizontal(|ui| {
+                    ui.label("Alpha");
+                    if ui.add(egui::Slider::new(&mut a, 0..=255).show_value(false)).changed() {
+                        new[3] = a;
+                    }
+                });
+                let mut hex = format!("{:02X}{:02X}{:02X}", new[0], new[1], new[2]);
+                ui.horizontal(|ui| {
+                    ui.label("Hex");
+                    if ui.add(egui::TextEdit::singleline(&mut hex).desired_width(64.0)).changed() {
+                        if let Ok(x) = u32::from_str_radix(hex.trim_start_matches('#'), 16) {
+                            if hex.trim_start_matches('#').len() == 6 {
+                                new = [(x >> 16) as u8, (x >> 8) as u8, x as u8, new[3]];
+                            }
+                        }
+                    }
+                });
+            });
+        });
+        if new != target {
+            if self.color_target_primary { self.palette.primary = new } else { self.palette.secondary = new }
+        }
+        ui.separator();
+        // palette grid: left click primary, right click secondary
+        let colors = default_palette();
+        ui.spacing_mut().item_spacing = Vec2::splat(1.0);
+        for row in colors.chunks(22) {
+            ui.horizontal(|ui| {
+                for c in row {
+                    let (r, resp) = ui.allocate_exact_size(Vec2::splat(13.0), Sense::click());
+                    ui.painter().rect_filled(r, 1.0, c32(*c));
+                    if resp.clicked() {
+                        self.palette.primary = *c;
+                    }
+                    if resp.secondary_clicked() {
+                        self.palette.secondary = *c;
+                    }
+                }
+            });
+        }
+    }
+}
+
 fn checker(p: &egui::Painter, r: Rect) {
     p.rect_filled(r, 0.0, Color32::WHITE);
     let s = 5.0;
@@ -2137,6 +2447,17 @@ impl eframe::App for App {
         let title = self.docs.get(self.active).map(|d| format!("{} - Pinta-rs", d.display_name())).unwrap_or_else(|| "Pinta-rs".into());
         ctx.send_viewport_cmd(egui::ViewportCommand::Title(title));
 
+        if self.skin_applied != Some(self.skin) {
+            ctx.set_visuals(if self.skin == Skin::Classic { classic_visuals() } else { egui::Visuals::dark() });
+            self.skin.save();
+            self.skin_applied = Some(self.skin);
+        }
+        if self.skin == Skin::Classic {
+            self.classic_ui(ui, &ctx);
+            self.dialogs(&ctx);
+            self.frame_ms = self.frame_ms * 0.9 + t0.elapsed().as_secs_f32() * 1000.0 * 0.1;
+            return;
+        }
         egui::Panel::top("menu").show(ui, |ui| self.menu_bar(ui));
         egui::Panel::top("toolbar").show(ui, |ui| self.toolbar(ui));
         egui::Panel::bottom("status").show(ui, |ui| self.status_bar(ui));
@@ -2147,7 +2468,10 @@ impl eframe::App for App {
         });
         egui::Panel::right("layers").default_size(230.0).show(ui, |ui| {
             ui.heading("Layers");
-            self.layers_panel(ui)
+            self.layers_panel(ui);
+            ui.separator();
+            ui.heading("History");
+            self.history_panel(ui)
         });
         egui::CentralPanel::default().frame(egui::Frame::new()).show(ui, |ui| self.canvas(ui));
         self.dialogs(&ctx);
