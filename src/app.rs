@@ -2182,7 +2182,6 @@ impl App {
             Dialog::PasteChoice { w, h, data, fit } => {
                 let (w, h, data) = (*w, *h, data.clone());
                 let canvas = self.docs.get(self.active).map(|d| (d.state.width, d.state.height));
-                let name = self.docs.get(self.active).map(|d| d.display_name()).unwrap_or_default();
                 egui::Window::new("Paste Image").collapsible(false).resizable(false).anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO).order(egui::Order::Foreground).show(ctx, |ui| {
                     ui.label(format!("Paste the {w} x {h} clipboard image where?"));
                     ui.add_space(6.0);
@@ -2192,13 +2191,13 @@ impl App {
                     let fitv = *fit;
                     let mut choice = None;
                     ui.horizontal(|ui| {
-                        if ui.add(egui::Button::new(format!("Into \"{name}\"")).fill(ui.visuals().selection.bg_fill)).on_hover_text("Paste onto the current layer (Enter)").clicked() || ui.input(|i| i.key_pressed(Key::Enter)) {
+                        if ui.add(egui::Button::new("Paste into current layer").fill(ui.visuals().selection.bg_fill)).on_hover_text("Paste onto the current layer (Enter)").clicked() || ui.input(|i| i.key_pressed(Key::Enter)) {
                             choice = Some(0u8);
                         }
-                        if ui.button("Into a new layer").clicked() {
+                        if ui.button("Paste into new layer").clicked() {
                             choice = Some(1);
                         }
-                        if ui.button("As a new image").on_hover_text("Open in a new tab").clicked() {
+                        if ui.button("Paste into new tab").clicked() {
                             choice = Some(2);
                         }
                         if ui.button("Cancel").clicked() || ui.input(|i| i.key_pressed(Key::Escape)) {
@@ -2215,7 +2214,6 @@ impl App {
                 let paths = paths.clone();
                 let canvas = self.docs.get(self.active).map(|d| (d.state.width, d.state.height));
                 let first = image::image_dimensions(&paths[0]).ok();
-                let name = self.docs.get(self.active).map(|d| d.display_name()).unwrap_or_default();
                 let what = if paths.len() == 1 { paths[0].file_name().map(|f| f.to_string_lossy().to_string()).unwrap_or_default() } else { format!("{} files", paths.len()) };
                 egui::Window::new("Dropped Image").collapsible(false).resizable(false).anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO).order(egui::Order::Foreground).show(ctx, |ui| {
                     ui.label(format!("What should happen with {what}?"));
@@ -2229,10 +2227,10 @@ impl App {
                         if ui.add(egui::Button::new("Open in new tab").fill(ui.visuals().selection.bg_fill)).on_hover_text("Enter").clicked() || ui.input(|i| i.key_pressed(Key::Enter)) {
                             choice = Some(2u8);
                         }
-                        if ui.button(format!("Paste into \"{name}\"")).clicked() {
+                        if ui.button("Paste into current layer").clicked() {
                             choice = Some(0);
                         }
-                        if ui.button("Paste as new layer").clicked() {
+                        if ui.button("Paste into new layer").clicked() {
                             choice = Some(1);
                         }
                         if ui.button("Cancel").clicked() || ui.input(|i| i.key_pressed(Key::Escape)) {
