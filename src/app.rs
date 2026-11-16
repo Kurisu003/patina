@@ -43,9 +43,9 @@ struct EffectJob {
 enum Dialog {
     None,
     /// Clipboard image: paste into the current image or open as a new one.
-    PasteChoice { w: u32, h: u32, data: Arc<Vec<u8>> },
+    PasteChoice { w: u32, h: u32, data: Arc<Vec<u8>>, fit: ops::PasteFit },
     /// Files dropped onto the window while an image is open.
-    DropChoice { paths: Vec<PathBuf> },
+    DropChoice { paths: Vec<PathBuf>, fit: ops::PasteFit },
     NewImage { w: u32, h: u32, bg: u8 },
     ResizeImage { pct: bool, percent: f32, w: u32, h: u32, keep: bool, mode: ops::Resample },
     CanvasSize { pct: bool, percent: f32, w: u32, h: u32, keep: bool, anchor: u8 },
@@ -435,14 +435,24 @@ impl App {
             p.copy_from_slice(&c);
         }
         if target == 0 && !self.docs.is_empty() {
-            self.dialog = Dialog::PasteChoice { w, h, data: Arc::new(data) };
+            let fit = self.default_fit(w, h);
+            self.dialog = Dialog::PasteChoice { w, h, data: Arc::new(data), fit };
             return;
         }
-        self.paste_data(w, h, &data, target, "Paste Into New Image");
+        let fit = self.default_fit(w, h);
+        self.paste_data(w, h, &data, target, "Paste Into New Image", fit);
+    }
+
+    /// Expand when the pasted image is bigger than the canvas, else keep.
+    fn default_fit(&self, w: u32, h: u32) -> ops::PasteFit {
+        match self.docs.get(self.active) {
+            Some(d) if w > d.state.width || h > d.state.height => ops::PasteFit::Expand,
+            _ => ops::PasteFit::Keep,
+        }
     }
 
     /// Place premultiplied pixels: 0 = current layer, 1 = new layer, 2 = new image.
-    fn paste_data(&mut self, w: u32, h: u32, data: &[u8], target: u8, new_label: &str) {
+    fn paste_data(&mut self, w: u32, h: u32, data: &[u8], target: u8, new_label: &str, fit: ops::PasteFit) {
         if target == 2 || self.docs.is_empty() {
             let s = Surface::from_rgba(w, h, &data);
             let n = self.docs.len() + 1;
@@ -456,7 +466,7 @@ impl App {
         let at = self.visible_origin(&self.docs[self.active]);
         let doc = &mut self.docs[self.active];
         self.tools.finish(doc);
-        ops::paste(doc, w, h, data, at, target == 1);
+        ops::paste(doc, w, h, data, at, target == 1, fit);
         self.tools.set_tool(None, ToolKind::MoveSelected);
     }
 
@@ -2070,12 +2080,17 @@ impl App {
                     }
                 }
             }
-            Dialog::PasteChoice { w, h, data } => {
+            Dialog::PasteChoice { w, h, data, fit } => {
                 let (w, h, data) = (*w, *h, data.clone());
+                let canvas = self.docs.get(self.active).map(|d| (d.state.width, d.state.height));
                 let name = self.docs.get(self.active).map(|d| d.display_name()).unwrap_or_default();
                 egui::Window::new("Paste Image").collapsible(false).resizable(false).anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO).order(egui::Order::Foreground).show(ctx, |ui| {
                     ui.label(format!("Paste the {w} x {h} clipboard image where?"));
                     ui.add_space(6.0);
+                    if let Some(c) = canvas {
+                        fit_choice(ui, fit, (w, h), c);
+                    }
+                    let fitv = *fit;
                     let mut choice = None;
                     ui.horizontal(|ui| {
                         if ui.add(egui::Button::new(format!("Into \"{name}\"")).fill(ui.visuals().selection.bg_fill)).on_hover_text("Paste onto the current layer (Enter)").clicked() || ui.input(|i| i.key_pressed(Key::Enter)) {
@@ -2092,18 +2107,24 @@ impl App {
                         }
                     });
                     if let Some(t) = choice {
-                        act = Some(Box::new(move |app: &mut App| app.paste_data(w, h, &data, t, "Paste Into New Image")));
+                        act = Some(Box::new(move |app: &mut App| app.paste_data(w, h, &data, t, "Paste Into New Image", fitv)));
                         close = true;
                     }
                 });
             }
-            Dialog::DropChoice { paths } => {
+            Dialog::DropChoice { paths, fit } => {
                 let paths = paths.clone();
+                let canvas = self.docs.get(self.active).map(|d| (d.state.width, d.state.height));
+                let first = image::image_dimensions(&paths[0]).ok();
                 let name = self.docs.get(self.active).map(|d| d.display_name()).unwrap_or_default();
                 let what = if paths.len() == 1 { paths[0].file_name().map(|f| f.to_string_lossy().to_string()).unwrap_or_default() } else { format!("{} files", paths.len()) };
                 egui::Window::new("Dropped Image").collapsible(false).resizable(false).anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO).order(egui::Order::Foreground).show(ctx, |ui| {
                     ui.label(format!("What should happen with {what}?"));
                     ui.add_space(6.0);
+                    if let (Some(c), Some(sz)) = (canvas, first) {
+                        fit_choice(ui, fit, sz, c);
+                    }
+                    let fitv = *fit;
                     let mut choice = None;
                     ui.horizontal(|ui| {
                         if ui.add(egui::Button::new("Open in new tab").fill(ui.visuals().selection.bg_fill)).on_hover_text("Enter").clicked() || ui.input(|i| i.key_pressed(Key::Enter)) {
@@ -2130,7 +2151,7 @@ impl App {
                                     Ok(d) => {
                                         let (w, h) = (d.state.width, d.state.height);
                                         let data = crate::tools::flatten(&d).read_rect(IRect::new(0, 0, w as i32, h as i32));
-                                        app.paste_data(w, h, &data, t, "Open Image");
+                                        app.paste_data(w, h, &data, t, "Open Image", fitv);
                                     }
                                     Err(e) => app.error = Some(e),
                                 }
@@ -2219,6 +2240,24 @@ impl App {
             self.quit_confirmed = true;
         }
     }
+}
+
+/// Size options for pasting into the current image or a new layer.
+fn fit_choice(ui: &mut egui::Ui, fit: &mut ops::PasteFit, (w, h): (u32, u32), (cw, ch): (u32, u32)) {
+    use ops::PasteFit::*;
+    egui::Frame::group(ui.style()).show(ui, |ui| {
+        ui.label(format!("When pasting into this image ({cw} x {ch}), the {w} x {h} picture should:"));
+        let ew = cw.max(w);
+        let eh = ch.max(h);
+        let cut = |fits: bool| if fits { "" } else { ", overhang cut off" };
+        ui.radio_value(fit, Expand, format!("Expand the canvas to fit  ({ew} x {eh})"));
+        ui.radio_value(fit, Keep, format!("Keep the canvas size  ({cw} x {ch}{})", cut(w <= cw && h <= ch)));
+        let wh = ((h as f64 * cw as f64 / w.max(1) as f64).round() as u32).max(1);
+        ui.radio_value(fit, Width, format!("Scale to the canvas width  (picture {cw} x {wh}{})", cut(wh <= ch)));
+        let hw = ((w as f64 * ch as f64 / h.max(1) as f64).round() as u32).max(1);
+        ui.radio_value(fit, Height, format!("Scale to the canvas height  (picture {hw} x {ch}{})", cut(hw <= cw)));
+    });
+    ui.add_space(6.0);
 }
 
 /// Pinta-style anchor grid icon: arrows point away from the anchor.
@@ -2523,7 +2562,9 @@ impl eframe::App for App {
                     self.open_path(p);
                 }
             } else {
-                self.dialog = Dialog::DropChoice { paths: dropped };
+                // only the first file's size picks the default fit
+                let fit = image::image_dimensions(&dropped[0]).map_or(ops::PasteFit::Expand, |(w, h)| self.default_fit(w, h));
+                self.dialog = Dialog::DropChoice { paths: dropped, fit };
             }
         }
         // text widgets (layer name, hex colour...) still need Ctrl+X/C/V

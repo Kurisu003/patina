@@ -464,11 +464,45 @@ pub fn copy_selection(doc: &Document, merged: bool) -> Option<(IRect, Vec<u8>)> 
     Some((r, data))
 }
 
+/// How a pasted image that doesn't match the canvas is fitted.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PasteFit {
+    /// Grow the canvas so the whole image fits.
+    Expand,
+    /// Keep the canvas; anything outside is cut off.
+    Keep,
+    /// Scale the pasted image to the canvas width (keeping its aspect).
+    Width,
+    /// Scale the pasted image to the canvas height (keeping its aspect).
+    Height,
+}
+
+/// Resample premultiplied RGBA to a new size (Lanczos; premultiplied input
+/// keeps transparent edges clean).
+fn scale_rgba(w: u32, h: u32, data: &[u8], nw: u32, nh: u32) -> Vec<u8> {
+    let img = image::RgbaImage::from_raw(w, h, data.to_vec()).expect("pixel buffer size");
+    let filter = if nw < w { image::imageops::FilterType::Lanczos3 } else { image::imageops::FilterType::CatmullRom };
+    image::imageops::resize(&img, nw.max(1), nh.max(1), filter).into_raw()
+}
+
 /// Paste premultiplied pixels into the current layer at `at`, selecting them.
-pub fn paste(doc: &mut Document, w: u32, h: u32, data: &[u8], at: (i32, i32), new_layer: bool) {
-    // Grow the canvas if the pasted image is larger (Pinta asks; we expand).
+pub fn paste(doc: &mut Document, w: u32, h: u32, data: &[u8], at: (i32, i32), new_layer: bool, fit: PasteFit) {
     let (cw, ch) = (doc.state.width, doc.state.height);
-    if w > cw || h > ch {
+    let scaled;
+    let (w, h, data, at) = match fit {
+        PasteFit::Width if w != cw => {
+            let nh = ((h as f64 * cw as f64 / w as f64).round() as u32).max(1);
+            scaled = scale_rgba(w, h, data, cw, nh);
+            (cw, nh, &scaled[..], (0, at.1))
+        }
+        PasteFit::Height if h != ch => {
+            let nw = ((w as f64 * ch as f64 / h as f64).round() as u32).max(1);
+            scaled = scale_rgba(w, h, data, nw, ch);
+            (nw, ch, &scaled[..], (at.0, 0))
+        }
+        _ => (w, h, data, at),
+    };
+    if fit == PasteFit::Expand && (w > cw || h > ch) {
         let nw = cw.max(w);
         let nh = ch.max(h);
         let st = &mut doc.state;
@@ -481,7 +515,8 @@ pub fn paste(doc: &mut Document, w: u32, h: u32, data: &[u8], at: (i32, i32), ne
         st.selection = Selection::default();
         doc.view.fit_pending = true;
     }
-    let at = (at.0.clamp(0, (doc.state.width - w) as i32), at.1.clamp(0, (doc.state.height - h) as i32));
+    // keep it on the canvas where possible; larger images start at the edge
+    let at = (at.0.min(doc.state.width as i32 - w as i32).max(0), at.1.min(doc.state.height as i32 - h as i32).max(0));
     let r = IRect::new(at.0, at.1, w as i32, h as i32);
     if new_layer {
         let st = &mut doc.state;
@@ -494,7 +529,7 @@ pub fn paste(doc: &mut Document, w: u32, h: u32, data: &[u8], at: (i32, i32), ne
     crate::raster::paste_rgba(&mut target, &base, data, r, &Selection::default(), crate::raster::PasteMode::Over);
     doc.state.layer_mut().surface = target;
     let (dw, dh) = (doc.state.width, doc.state.height);
-    doc.state.selection = Selection { mask: Some(Mask::from_rect(dw, dh, r)) };
+    doc.state.selection = Selection { mask: Some(Mask::from_rect(dw, dh, r.intersect(&IRect::new(0, 0, dw as i32, dh as i32)))) };
     doc.commit(if new_layer { "Paste Into New Layer" } else { "Paste" });
 }
 
