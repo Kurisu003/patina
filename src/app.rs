@@ -42,6 +42,7 @@ struct EffectJob {
 
 enum Dialog {
     None,
+    Preferences { w: u32, h: u32, bg: u8 },
     /// Clipboard image: paste into the current image or open as a new one.
     PasteChoice { w: u32, h: u32, data: Arc<Vec<u8>>, fit: ops::PasteFit },
     /// Files dropped onto the window while an image is open.
@@ -70,6 +71,7 @@ pub struct App {
     last_effect: Option<usize>,
     dialog: Dialog,
     show_grid: bool,
+    prefs: Prefs,
     skin: Skin,
     skin_applied: Option<Skin>,
     win_tools: bool,
@@ -116,6 +118,43 @@ impl Skin {
         if let Some(p) = Self::path() {
             let _ = std::fs::create_dir_all(p.parent().unwrap());
             let _ = std::fs::write(p, if self == Skin::Classic { "classic" } else { "pinta" });
+        }
+    }
+}
+
+/// User preferences, stored in ~/.config/patina/prefs as key=value lines.
+#[derive(Clone, Copy, Debug)]
+struct Prefs {
+    /// Default canvas for the startup image and New Image.
+    w: u32,
+    h: u32,
+    /// 0 white, 1 secondary color, 2 transparent
+    bg: u8,
+}
+
+impl Prefs {
+    fn path() -> Option<PathBuf> {
+        std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config/patina/prefs"))
+    }
+    fn load() -> Prefs {
+        let mut p = Prefs { w: 800, h: 600, bg: 0 };
+        let text = Self::path().and_then(|f| std::fs::read_to_string(f).ok()).unwrap_or_default();
+        for line in text.lines() {
+            let Some((k, v)) = line.split_once('=') else { continue };
+            let v = v.trim();
+            match k.trim() {
+                "canvas_width" => p.w = v.parse().unwrap_or(p.w).clamp(1, 100_000),
+                "canvas_height" => p.h = v.parse().unwrap_or(p.h).clamp(1, 100_000),
+                "canvas_background" => p.bg = v.parse().unwrap_or(p.bg).min(2),
+                _ => {}
+            }
+        }
+        p
+    }
+    fn save(self) {
+        if let Some(f) = Self::path() {
+            let _ = std::fs::create_dir_all(f.parent().unwrap());
+            let _ = std::fs::write(f, format!("canvas_width={}\ncanvas_height={}\ncanvas_background={}\n", self.w, self.h, self.bg));
         }
     }
 }
@@ -179,6 +218,7 @@ impl App {
             last_effect: None,
             dialog: Dialog::None,
             show_grid: false,
+            prefs: Prefs::load(),
             skin: Skin::load(),
             skin_applied: None,
             win_tools: true,
@@ -204,7 +244,9 @@ impl App {
             app.open_path(f);
         }
         if app.docs.is_empty() {
-            app.docs.push(Document::new("Unsaved Image 1", 800, 600, Some([255, 255, 255, 255])));
+            let p = app.prefs;
+            let bg = app.bg_color(p.bg);
+            app.docs.push(Document::new("Unsaved Image 1", p.w, p.h, bg));
         }
         app
     }
@@ -472,6 +514,14 @@ impl App {
         self.tools.set_tool(None, ToolKind::MoveSelected);
     }
 
+    fn bg_color(&self, bg: u8) -> Option<[u8; 4]> {
+        match bg {
+            0 => Some([255, 255, 255, 255]),
+            1 => Some(self.palette.secondary),
+            _ => None,
+        }
+    }
+
     fn visible_origin(&self, doc: &Document) -> (i32, i32) {
         let ppp = 1.0;
         let z = doc.view.zoom / ppp;
@@ -581,7 +631,7 @@ impl App {
         let cs = Modifiers::COMMAND | Modifiers::SHIFT;
         let ca = Modifiers::COMMAND | Modifiers::ALT;
         if sc(Modifiers::COMMAND, Key::N) {
-            self.dialog = Dialog::NewImage { w: 800, h: 600, bg: 0 };
+            self.dialog = Dialog::NewImage { w: self.prefs.w, h: self.prefs.h, bg: self.prefs.bg };
         }
         if sc(Modifiers::COMMAND, Key::O) {
             self.open_dialog();
@@ -675,6 +725,11 @@ impl App {
         if sc(Modifiers::COMMAND, Key::I) {
             if let Some(d) = self.doc() {
                 ops::invert_selection(d);
+            }
+        }
+        if sc(cs, Key::I) {
+            if let Some(i) = self.effects.iter().position(|e| e.name() == "Invert Colors") {
+                self.start_effect(i);
             }
         }
         if sc(Modifiers::NONE, Key::Delete) {
@@ -875,7 +930,7 @@ impl App {
         egui::MenuBar::new().ui(ui, |ui| {
             ui.menu_button("File", |ui| {
                 if ui.add(egui::Button::new("New…").shortcut_text("Ctrl+N")).clicked() {
-                    self.dialog = Dialog::NewImage { w: 800, h: 600, bg: 0 };
+                    self.dialog = Dialog::NewImage { w: self.prefs.w, h: self.prefs.h, bg: self.prefs.bg };
                 }
                 if ui.add(egui::Button::new("Open…").shortcut_text("Ctrl+O")).clicked() {
                     self.open_dialog();
@@ -954,6 +1009,11 @@ impl App {
                     if let Some(d) = self.doc() {
                         ops::invert_selection(d);
                     }
+                }
+                ui.separator();
+                if ui.button("Preferences...").clicked() {
+                    let p = self.prefs;
+                    self.dialog = Dialog::Preferences { w: p.w, h: p.h, bg: p.bg };
                 }
             });
             ui.menu_button("View", |ui| {
@@ -1055,6 +1115,7 @@ impl App {
                         Some(img) => egui::Button::image_and_text(img.tint(tint), label),
                         None => egui::Button::new(label),
                     };
+                    let btn = if name == "Invert Colors" { btn.shortcut_text("Ctrl+Shift+I") } else { btn };
                     if ui.add_enabled(!self.busy(), btn).clicked() {
                         self.start_effect(i);
                     }
@@ -1839,6 +1900,50 @@ impl App {
         let mut act: Option<Box<dyn FnOnce(&mut App)>> = None;
         match &mut self.dialog {
             Dialog::None => {}
+            Dialog::Preferences { w, h, bg } => {
+                egui::Window::new("Preferences").collapsible(false).resizable(false).anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO).order(egui::Order::Foreground).show(ctx, |ui| {
+                    ui.strong("Default canvas");
+                    ui.weak("Used for the image Patina starts with and as the New Image size.");
+                    ui.add_space(4.0);
+                    egui::Grid::new("prefs").num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
+                        ui.label("Width:");
+                        ui.add(egui::DragValue::new(w).range(1..=100_000).suffix(" px"));
+                        ui.end_row();
+                        ui.label("Height:");
+                        ui.add(egui::DragValue::new(h).range(1..=100_000).suffix(" px"));
+                        ui.end_row();
+                        ui.label("Background:");
+                        ui.horizontal(|ui| {
+                            ui.selectable_value(bg, 0, "White");
+                            ui.selectable_value(bg, 1, "Secondary Color");
+                            ui.selectable_value(bg, 2, "Transparent");
+                        });
+                        ui.end_row();
+                    });
+                    ui.horizontal(|ui| {
+                        for (n, a, b) in [("800x600", 800, 600), ("1920x1080", 1920, 1080), ("2560x1440", 2560, 1440), ("3840x2160", 3840, 2160)] {
+                            if ui.small_button(n).clicked() {
+                                *w = a;
+                                *h = b;
+                            }
+                        }
+                    });
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        if ui.button("Cancel").clicked() {
+                            close = true;
+                        }
+                        if ui.add(egui::Button::new("Save").fill(ui.visuals().selection.bg_fill)).clicked() {
+                            let p = Prefs { w: *w, h: *h, bg: *bg };
+                            act = Some(Box::new(move |app: &mut App| {
+                                app.prefs = p;
+                                p.save();
+                            }));
+                            close = true;
+                        }
+                    });
+                });
+            }
             Dialog::NewImage { w, h, bg } => {
                 egui::Window::new("New Image").collapsible(false).resizable(false).anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO).order(egui::Order::Foreground).show(ctx, |ui| {
                     egui::Grid::new("ni").num_columns(2).show(ui, |ui| {
@@ -1871,11 +1976,7 @@ impl App {
                         if ui.button("OK").clicked() {
                             let (w, h, bg) = (*w, *h, *bg);
                             act = Some(Box::new(move |app: &mut App| {
-                                let c = match bg {
-                                    0 => Some([255, 255, 255, 255]),
-                                    1 => Some(app.palette.secondary),
-                                    _ => None,
-                                };
+                                let c = app.bg_color(bg);
                                 let n = app.docs.len() + 1;
                                 let d = Document::new(format!("Unsaved Image {n}"), w, h, c);
                                 app.docs.push(d);
@@ -2305,7 +2406,7 @@ impl App {
             ui.horizontal(|ui| {
                 let b = |ui: &mut egui::Ui, t: &str, tip: &str| ui.add(egui::Button::new(t).small()).on_hover_text(tip).clicked();
                 if b(ui, "New", "New image (Ctrl+N)") {
-                    self.dialog = Dialog::NewImage { w: 800, h: 600, bg: 0 };
+                    self.dialog = Dialog::NewImage { w: self.prefs.w, h: self.prefs.h, bg: self.prefs.bg };
                 }
                 if b(ui, "Open", "Open (Ctrl+O)") {
                     self.open_dialog();

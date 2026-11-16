@@ -55,6 +55,7 @@ Some timings on a 400 MP (20000 x 20000) image: brush stroke segment 0.2 ms, mag
   - Image > Center Object (horizontally, vertically or both).
   - Paste or drop an image and choose: into this image, a new layer or a new tab,
     and whether to expand the canvas, keep it, or fit to its width or height.
+  - Edit > Preferences: default canvas size and background for new images and startup.
   - Optional **Classic** skin (View > Skin) with a light theme, floating Tools / History /
     Layers / Colors windows (F5-F8) and a color wheel, for people used to Paint.NET.
 
@@ -67,6 +68,7 @@ Some timings on a 400 MP (20000 x 20000) image: brush stroke segment 0.2 ms, mag
 | Ctrl+X / Ctrl+C / Ctrl+V | Cut / Copy / Paste |
 | Ctrl+Shift+V | Paste into new layer |
 | Ctrl+A / Ctrl+Shift+A / Ctrl+I | Select all / Deselect / Invert selection |
+| Ctrl+Shift+I | Invert colors |
 | Ctrl+R / Ctrl+Shift+R | Resize image / Resize canvas |
 | Ctrl+Shift+X | Crop to selection |
 | Ctrl+B / Ctrl+0 | Best fit / Actual size |
