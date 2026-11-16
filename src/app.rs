@@ -78,6 +78,7 @@ pub struct App {
     cursor: Option<[f32; 2]>,
     quit_confirmed: bool,
     palette_edit: Option<bool>,
+    script: Option<crate::script::Script>,
 }
 
 fn default_palette() -> Vec<[u8; 4]> {
@@ -132,6 +133,7 @@ impl App {
             cursor: None,
             quit_confirmed: false,
             palette_edit: None,
+            script: std::env::var("PINTA_SCRIPT").ok().and_then(|p| crate::script::Script::load(&p)),
         };
         for f in files {
             app.open_path(f);
@@ -483,7 +485,19 @@ impl App {
 
     fn shortcuts(&mut self, ctx: &egui::Context) {
         let typing = ctx.egui_wants_keyboard_input();
-        let sc = |m: Modifiers, k: Key| ctx.input_mut(|i| i.consume_shortcut(&KeyboardShortcut::new(m, k)));
+        // exact modifier match (egui's consume_shortcut lets Ctrl+N fire on Ctrl+Shift+N)
+        let sc = |m: Modifiers, k: Key| {
+            ctx.input_mut(|i| {
+                let pos = i.events.iter().position(|e| matches!(e, egui::Event::Key { key, pressed: true, modifiers, .. } if *key == k && modifiers.matches_exact(m)));
+                match pos {
+                    Some(p) => {
+                        i.events.remove(p);
+                        true
+                    }
+                    None => false,
+                }
+            })
+        };
         let cs = Modifiers::COMMAND | Modifiers::SHIFT;
         let ca = Modifiers::COMMAND | Modifiers::ALT;
         if sc(Modifiers::COMMAND, Key::N) {
@@ -668,6 +682,49 @@ impl App {
         if ctx.input(|i| i.key_pressed(Key::CloseBracket)) {
             self.tools.settings.brush_width = (self.tools.settings.brush_width + 1.0).min(1000.0);
         }
+    }
+
+    /// Route keyboard input to the text tool while it is editing. Returns
+    /// true when text editing consumed the keyboard.
+    fn text_input(&mut self, ctx: &egui::Context) -> bool {
+        use crate::tools::TextKey;
+        if !self.tools.text_editing() || ctx.egui_wants_keyboard_input() {
+            return false;
+        }
+        let events = ctx.input(|i| i.events.clone());
+        let mut keys = Vec::new();
+        for e in events {
+            match e {
+                egui::Event::Text(t) => keys.push(TextKey::Insert(t)),
+                egui::Event::Key { key, pressed: true, modifiers, .. } => match key {
+                    Key::Backspace => keys.push(TextKey::Backspace),
+                    Key::Delete => keys.push(TextKey::Delete),
+                    Key::Enter if modifiers.command => keys.push(TextKey::Commit),
+                    Key::Enter => keys.push(TextKey::Insert("\n".into())),
+                    Key::ArrowLeft => keys.push(TextKey::Left),
+                    Key::ArrowRight => keys.push(TextKey::Right),
+                    Key::ArrowUp => keys.push(TextKey::Up),
+                    Key::ArrowDown => keys.push(TextKey::Down),
+                    Key::Home => keys.push(TextKey::Home),
+                    Key::End => keys.push(TextKey::End),
+                    Key::Escape => keys.push(TextKey::Commit),
+                    _ => {}
+                },
+                _ => {}
+            }
+        }
+        // swallow everything so tool letters and Delete/Backspace shortcuts don't fire
+        ctx.input_mut(|i| {
+            i.events.retain(|e| !matches!(e, egui::Event::Text(_) | egui::Event::Key { .. }));
+        });
+        let tools = &mut self.tools;
+        let pal = &self.palette;
+        if let Some(d) = self.docs.get_mut(self.active) {
+            for k in keys {
+                tools.text_key(d, pal, k);
+            }
+        }
+        true
     }
 
     fn open_resize(&mut self) {
@@ -1068,6 +1125,41 @@ impl App {
             if t == ToolKind::CloneStamp {
                 ui.label("Ctrl+click to set the source");
             }
+            if t == ToolKind::Text {
+                let tp = &mut self.tools.text_params;
+                let mut ch = false;
+                let cat = crate::text::catalog();
+                egui::ComboBox::from_id_salt("font").width(160.0).selected_text(&tp.family).height(400.0).show_ui(ui, |ui| {
+                    for f in &cat.families {
+                        ch |= ui.selectable_value(&mut tp.family, f.clone(), f).changed();
+                    }
+                });
+                ch |= ui.add(egui::DragValue::new(&mut tp.size).range(1.0..=2000.0).speed(0.5).suffix(" px")).changed();
+                ch |= ui.toggle_value(&mut tp.bold, egui::RichText::new("B").strong()).on_hover_text("Bold").changed();
+                ch |= ui.toggle_value(&mut tp.italic, egui::RichText::new("I").italics()).on_hover_text("Italic").changed();
+                ch |= ui.toggle_value(&mut tp.underline, egui::RichText::new("U").underline()).on_hover_text("Underline").changed();
+                ui.separator();
+                for (a, n) in [(crate::text::Align::Left, "Left"), (crate::text::Align::Center, "Center"), (crate::text::Align::Right, "Right")] {
+                    ch |= ui.selectable_value(&mut tp.align, a, n).changed();
+                }
+                ui.separator();
+                egui::ComboBox::from_id_salt("tstyle").selected_text(tp.style.name()).show_ui(ui, |ui| {
+                    for st in crate::text::TextStyle::ALL {
+                        ch |= ui.selectable_value(&mut tp.style, st, st.name()).changed();
+                    }
+                });
+                if matches!(tp.style, crate::text::TextStyle::Outline | crate::text::TextStyle::NormalOutline) {
+                    ui.label("Outline width:");
+                    ch |= ui.add(egui::DragValue::new(&mut tp.outline_width).range(0.5..=100.0).speed(0.1)).changed();
+                }
+                ch |= ui.checkbox(&mut tp.antialias, "Antialiasing").changed();
+                if ch {
+                    let pal = &self.palette;
+                    if let Some(d) = self.docs.get_mut(self.active) {
+                        self.tools.rerender_text(d, pal);
+                    }
+                }
+            }
             if t == ToolKind::MoveSelected {
                 ui.label("Left drag moves, right drag rotates (Shift snaps)");
             }
@@ -1347,6 +1439,11 @@ impl App {
             });
         }
         let (rect, resp) = ui.allocate_exact_size(ui.available_size(), Sense::click_and_drag());
+        // the canvas must never hold keyboard focus, or tool shortcuts and
+        // text-tool typing would be swallowed as "egui wants keyboard input"
+        if resp.has_focus() {
+            resp.surrender_focus();
+        }
         self.canvas_rect = rect;
         let painter = ui.painter_at(rect);
         painter.rect_filled(rect, 0.0, ui.visuals().extreme_bg_color);
@@ -1396,7 +1493,8 @@ impl App {
         let rc = rect.center();
         let to_img = move |p: Pos2| [center[0] + (p.x - rc.x) / z, center[1] + (p.y - rc.y) / z];
         self.cursor = hover.filter(|h| rect.contains(*h)).map(to_img);
-        if self.job.is_none() {
+        let modal = !matches!(self.dialog, Dialog::None) || self.palette_edit.is_some();
+        if self.job.is_none() && !modal {
             let pointer = |p: Pos2, secondary: bool| Pointer { pos: to_img(p), screen: [p.x, p.y], secondary, shift: mods.shift, ctrl: mods.command, alt: mods.alt };
             let mut reqs = Vec::new();
             if space && resp.dragged_by(egui::PointerButton::Primary) {
@@ -1873,6 +1971,12 @@ fn checker(p: &egui::Painter, r: Rect) {
 }
 
 impl eframe::App for App {
+    fn raw_input_hook(&mut self, ctx: &egui::Context, raw: &mut egui::RawInput) {
+        if let Some(s) = self.script.as_mut() {
+            s.step(ctx, raw);
+        }
+    }
+
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let t0 = Instant::now();
         let ctx = ui.ctx().clone();
@@ -1896,7 +2000,9 @@ impl eframe::App for App {
         }
         self.poll_effect(&ctx);
         if matches!(self.dialog, Dialog::None) {
-            self.shortcuts(&ctx);
+            if !self.text_input(&ctx) {
+                self.shortcuts(&ctx);
+            }
         }
         let title = self.docs.get(self.active).map(|d| format!("{} - Pinta-rs", d.display_name())).unwrap_or_else(|| "Pinta-rs".into());
         ctx.send_viewport_cmd(egui::ViewportCommand::Title(title));

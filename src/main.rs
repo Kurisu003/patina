@@ -12,8 +12,10 @@ mod io;
 mod ops;
 mod raster;
 mod selection;
+mod script;
 mod selftest;
 mod surface;
+mod text;
 mod tools;
 
 use eframe::egui;

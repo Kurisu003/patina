@@ -464,7 +464,21 @@ struct MoveSelectedState {
     rot_start: f32,
 }
 
+pub struct TextEdit {
+    pub origin: [f32; 2],
+    pub text: String,
+    /// Caret as a char index into `text`.
+    pub caret: usize,
+    base: Surface,
+    pub bounds: IRect,
+    layout_lines: Vec<(f32, f32, f32)>,
+    layout_carets: Vec<Vec<f32>>,
+    line_height: f32,
+}
+
 pub struct Tools {
+    pub text: Option<TextEdit>,
+    pub text_params: crate::text::TextParams,
     pub current: ToolKind,
     pub previous: ToolKind,
     pub settings: ToolSettings,
@@ -485,6 +499,8 @@ pub enum ViewRequest {
 impl Default for Tools {
     fn default() -> Self {
         Tools {
+            text: None,
+            text_params: crate::text::TextParams::default(),
             current: ToolKind::Paintbrush,
             previous: ToolKind::Paintbrush,
             settings: ToolSettings::default(),
@@ -561,6 +577,7 @@ impl Tools {
 
     /// Commit or cancel any in-progress gesture (e.g. when switching tools).
     pub fn finish(&mut self, doc: &mut Document) {
+        self.commit_text(doc);
         if !matches!(self.active, Active::None) {
             self.active = Active::None;
             doc.revert_uncommitted();
@@ -569,6 +586,7 @@ impl Tools {
 
     pub fn cancel(&mut self, doc: &mut Document) {
         self.active = Active::None;
+        self.text = None;
         doc.revert_uncommitted();
     }
 
@@ -740,7 +758,27 @@ impl Tools {
             ToolKind::Pan => self.active = Active::Pan { last: p.screen },
             ToolKind::Zoom => self.active = Active::ZoomRect { start: p.pos, end: p.pos, out: p.secondary },
             ToolKind::Text => {
-                self.status = "Text tool is not ported yet".into();
+                if let Some(te) = &self.text {
+                    if te.bounds.inflate(4).contains(p.pos[0] as i32, p.pos[1] as i32) {
+                        // click inside the text being edited: move the caret
+                        let caret = te.caret_at(p.pos);
+                        self.text.as_mut().unwrap().caret = caret;
+                        return ViewRequest::None;
+                    }
+                    self.commit_text(doc);
+                }
+                let base = doc.state.layer().surface.clone();
+                self.text = Some(TextEdit {
+                    origin: [p.pos[0].round(), p.pos[1].round()],
+                    text: String::new(),
+                    caret: 0,
+                    base,
+                    bounds: IRect::new(p.pos[0] as i32, p.pos[1] as i32, 1, self.text_params.size as i32),
+                    layout_lines: vec![],
+                    layout_carets: vec![vec![0.0]],
+                    line_height: self.text_params.size * 1.2,
+                });
+                self.render_text(doc, pal);
             }
         }
         ViewRequest::None
@@ -783,7 +821,6 @@ impl Tools {
                 };
                 let base = base.clone();
                 apply_selection(doc, &base, m, *mode);
-                self.status = format!("Selection {} x {}", r.w, r.h);
             }
             Active::Lasso { points, base, mode } => {
                 points.push(p.pos);
@@ -978,6 +1015,18 @@ impl Tools {
                 painter.add(egui::Shape::line(pts, dark));
             }
             _ => {}
+        }
+        if let Some(te) = &self.text {
+            let b = te.bounds;
+            let r = egui::Rect::from_two_pos(to_screen([b.x as f32 - 2.0, b.y as f32 - 2.0]), to_screen([(b.right() + 2) as f32, (b.bottom() + 2) as f32]));
+            painter.rect_stroke(r, 0.0, Stroke::new(1.0, Color32::from_rgba_unmultiplied(80, 80, 80, 160)), egui::StrokeKind::Middle);
+            let (line, col) = te.caret_line_col();
+            let (x0, base, _) = te.layout_lines.get(line).copied().unwrap_or((0.0, te.line_height * 0.8, 0.0));
+            let cx = x0 + te.layout_carets.get(line).and_then(|c| c.get(col)).copied().unwrap_or(0.0);
+            let top = base - te.line_height * 0.8;
+            let a = to_screen([te.origin[0] + cx, te.origin[1] + top]);
+            let bpos = to_screen([te.origin[0] + cx, te.origin[1] + top + te.line_height]);
+            painter.line_segment([a, bpos], Stroke::new(2.0, Color32::from_rgb(30, 90, 220)));
         }
         if let Some(h) = self.hover {
             let c = to_screen(h);
@@ -1252,4 +1301,140 @@ fn render_move_selected(doc: &mut Document, ms: &MoveSelectedState) {
         let _ = (cx, cy);
     }
     doc.state.layer_mut().surface = target;
+}
+
+impl TextEdit {
+    fn caret_line_col(&self) -> (usize, usize) {
+        let mut line = 0;
+        let mut col = 0;
+        for (i, ch) in self.text.chars().enumerate() {
+            if i == self.caret {
+                break;
+            }
+            if ch == '\n' {
+                line += 1;
+                col = 0;
+            } else {
+                col += 1;
+            }
+        }
+        (line, col)
+    }
+
+    fn caret_at(&self, pos: [f32; 2]) -> usize {
+        let ly = ((pos[1] - self.origin[1]) / self.line_height).floor().max(0.0) as usize;
+        let ly = ly.min(self.layout_lines.len().saturating_sub(1));
+        let x = pos[0] - self.origin[0] - self.layout_lines.get(ly).map_or(0.0, |l| l.0);
+        let carets = self.layout_carets.get(ly).cloned().unwrap_or_else(|| vec![0.0]);
+        let col = carets.iter().enumerate().min_by(|a, b| (a.1 - x).abs().partial_cmp(&(b.1 - x).abs()).unwrap()).map_or(0, |(i, _)| i);
+        // char index of (ly, col)
+        let mut idx = 0;
+        for (n, line) in self.text.split('\n').enumerate() {
+            if n == ly {
+                return idx + col.min(line.chars().count());
+            }
+            idx += line.chars().count() + 1;
+        }
+        self.text.chars().count()
+    }
+}
+
+pub enum TextKey {
+    Insert(String),
+    Backspace,
+    Delete,
+    Left,
+    Right,
+    Up,
+    Down,
+    Home,
+    End,
+    Commit,
+}
+
+impl Tools {
+    pub fn text_editing(&self) -> bool {
+        self.text.is_some()
+    }
+
+    pub fn commit_text(&mut self, doc: &mut Document) {
+        if let Some(te) = self.text.take() {
+            if te.text.trim().is_empty() {
+                doc.state.layer_mut().surface = te.base;
+                doc.revert_uncommitted();
+            } else {
+                doc.commit("Text");
+            }
+        }
+    }
+
+    pub fn text_key(&mut self, doc: &mut Document, pal: &Palette, k: TextKey) {
+        let Some(te) = self.text.as_mut() else { return };
+        let n = te.text.chars().count();
+        let byte = |t: &str, ci: usize| t.char_indices().nth(ci).map_or(t.len(), |(b, _)| b);
+        match k {
+            TextKey::Insert(s) => {
+                let b = byte(&te.text, te.caret);
+                te.text.insert_str(b, &s);
+                te.caret += s.chars().count();
+            }
+            TextKey::Backspace => {
+                if te.caret > 0 {
+                    let b = byte(&te.text, te.caret - 1);
+                    te.text.remove(b);
+                    te.caret -= 1;
+                }
+            }
+            TextKey::Delete => {
+                if te.caret < n {
+                    let b = byte(&te.text, te.caret);
+                    te.text.remove(b);
+                }
+            }
+            TextKey::Left => te.caret = te.caret.saturating_sub(1),
+            TextKey::Right => te.caret = (te.caret + 1).min(n),
+            TextKey::Home | TextKey::End | TextKey::Up | TextKey::Down => {
+                let (line, col) = te.caret_line_col();
+                let lines: Vec<usize> = te.text.split('\n').map(|l| l.chars().count()).collect();
+                let start_of = |l: usize| lines[..l].iter().map(|c| c + 1).sum::<usize>();
+                te.caret = match k {
+                    TextKey::Home => start_of(line),
+                    TextKey::End => start_of(line) + lines[line],
+                    TextKey::Up if line > 0 => start_of(line - 1) + col.min(lines[line - 1]),
+                    TextKey::Down if line + 1 < lines.len() => start_of(line + 1) + col.min(lines[line + 1]),
+                    _ => te.caret,
+                };
+            }
+            TextKey::Commit => {
+                self.commit_text(doc);
+                return;
+            }
+        }
+        self.render_text(doc, pal);
+    }
+
+    pub fn rerender_text(&mut self, doc: &mut Document, pal: &Palette) {
+        if self.text.is_some() {
+            self.render_text(doc, pal);
+        }
+    }
+
+    fn render_text(&mut self, doc: &mut Document, pal: &Palette) {
+        let params = self.text_params.clone();
+        let Some(te) = self.text.as_mut() else { return };
+        let (layout, _) = crate::text::layout_and_path(&te.text, &params);
+        te.layout_lines = layout.lines.clone();
+        te.layout_carets = layout.carets.clone();
+        te.line_height = layout.line_height;
+        te.bounds = IRect::new(te.origin[0] as i32, te.origin[1] as i32, layout.width.ceil().max(1.0) as i32, layout.height.ceil() as i32);
+        let sel = doc.state.selection.clone();
+        let mut target = te.base.clone();
+        if !te.text.is_empty() {
+            if let Some((pm, off, _)) = crate::text::render(&te.text, &params, pal.primary, pal.secondary) {
+                let at = (te.origin[0] as i32 + off.0, te.origin[1] as i32 + off.1);
+                paste_pixmap(&mut target, &te.base, &pm, at, &sel, PasteMode::Over);
+            }
+        }
+        doc.state.layer_mut().surface = target;
+    }
 }

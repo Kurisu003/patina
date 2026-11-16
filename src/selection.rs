@@ -374,17 +374,26 @@ impl Mask {
                     _ => None,
                 };
                 let mut segs = Vec::new();
-                let on = |t: &MTile, x: usize, y: usize| t.get(x, y) >= 128;
-                // Interior edges only matter for partial tiles.
-                let interior = uniform(me).is_none();
+                let (iw, ih) = (self.width as i32, self.height as i32);
+                // a pixel counts as selected only inside the image
+                let on_at = |t: &MTile, x: usize, y: usize, ox: i32, oy: i32| ox + (x as i32) < iw && oy + (y as i32) < ih && t.get(x, y) >= 128;
+                let on = |t: &MTile, x: usize, y: usize| on_at(t, x, y, tr.x, tr.y);
+                let on_left = |t: &MTile, x: usize, y: usize| on_at(t, x, y, tr.x - TILE as i32, tr.y);
+                let on_up = |t: &MTile, x: usize, y: usize| on_at(t, x, y, tr.x, tr.y - TILE as i32);
+                // Interior edges only matter for partial tiles and tiles cut by the image edge.
+                let cut = tr.right() > iw || tr.bottom() > ih;
+                let interior = uniform(me).is_none() || cut;
                 // Horizontal edges: boundary above row y (between y-1 and y).
                 for y in 0..=TILE {
+                    if y > 0 && y < TILE && !interior {
+                        continue;
+                    }
                     let mut run: Option<usize> = None;
                     for x in 0..=TILE {
                         let edge = if x == TILE {
                             false
                         } else if y == 0 {
-                            let a = up.map(|u| on(u, x, TILE - 1)).unwrap_or(false);
+                            let a = up.map(|u| on_up(u, x, TILE - 1)).unwrap_or(false);
                             a != on(me, x, 0)
                         } else if y == TILE {
                             // only at the image bottom (next tile handles otherwise)
@@ -401,9 +410,6 @@ impl Mask {
                             _ => {}
                         }
                     }
-                    if y > 0 && y < TILE && !interior {
-                        continue;
-                    }
                 }
                 // Vertical edges: boundary left of column x.
                 for x in 0..=TILE {
@@ -415,7 +421,7 @@ impl Mask {
                         let edge = if y == TILE {
                             false
                         } else if x == 0 {
-                            let a = left.map(|l| on(l, TILE - 1, y)).unwrap_or(false);
+                            let a = left.map(|l| on_left(l, TILE - 1, y)).unwrap_or(false);
                             a != on(me, 0, y)
                         } else if x == TILE {
                             right_edge && on(me, TILE - 1, y)
