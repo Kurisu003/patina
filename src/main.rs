@@ -24,6 +24,13 @@ use std::sync::Arc;
 
 fn main() -> eframe::Result {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("pinta_rs=info,wgpu=warn")).init();
+    // winit only delivers dropped files on X11, so prefer XWayland when an X
+    // display exists (KDE scales X11 apps sharply). PINTA_WAYLAND=1 forces
+    // native Wayland.
+    if std::env::var_os("PINTA_WAYLAND").is_none() && std::env::var_os("DISPLAY").is_some() {
+        // SAFETY: single-threaded at this point, before any other thread starts.
+        unsafe { std::env::remove_var("WAYLAND_DISPLAY") };
+    }
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.first().map(String::as_str) == Some("--selftest") {
         selftest::run(args.get(1).and_then(|s| s.parse().ok()).unwrap_or(20000));

@@ -204,6 +204,8 @@ pub enum SampleFrom {
 
 pub struct ToolSettings {
     pub brush_width: f32,
+    /// Brush edge hardness in percent (paintbrush, eraser, clone stamp).
+    pub hardness: f32,
     pub antialias: bool,
     pub alpha_blending: bool,
     pub fill_style: FillStyle,
@@ -224,6 +226,7 @@ impl Default for ToolSettings {
     fn default() -> Self {
         ToolSettings {
             brush_width: 2.0,
+            hardness: 100.0,
             antialias: true,
             alpha_blending: true,
             fill_style: FillStyle::Outline,
@@ -292,6 +295,8 @@ struct StrokeState {
     width: f32,
     aa: bool,
     pixel: bool,
+    /// 0..1, 1 = hard edge
+    hardness: f32,
 }
 
 impl StrokeState {
@@ -329,6 +334,32 @@ impl StrokeState {
                 if e2 <= dx {
                     err += dx;
                     y0 += sy;
+                }
+            }
+        } else if self.hardness < 0.999 {
+            // Soft brush: coverage from distance to the segment, full inside
+            // radius*hardness, smoothly fading to zero at the radius. Max-merged
+            // per stroke, so overlapping segments don't build up dark dots.
+            let r = (self.width / 2.0).max(0.5);
+            let inner = r * self.hardness;
+            let span = (r - inner).max(1.0);
+            let (vx, vy) = (b[0] - a[0], b[1] - a[1]);
+            let l2 = vx * vx + vy * vy;
+            let data = m.data_mut();
+            for y in 0..bbox.h {
+                let py = (bbox.y + y) as f32 + 0.5;
+                for x in 0..bbox.w {
+                    let px = (bbox.x + x) as f32 + 0.5;
+                    let t = if l2 > 1e-6 { (((px - a[0]) * vx + (py - a[1]) * vy) / l2).clamp(0.0, 1.0) } else { 0.0 };
+                    let dx = px - (a[0] + vx * t);
+                    let dy = py - (a[1] + vy * t);
+                    let d = (dx * dx + dy * dy).sqrt();
+                    if d >= r {
+                        continue;
+                    }
+                    let k = ((r - d) / span).clamp(0.0, 1.0);
+                    let k = k * k * (3.0 - 2.0 * k);
+                    data[(y * bbox.w + x) as usize] = (k * 255.0).round() as u8;
                 }
             }
         } else {
@@ -450,6 +481,7 @@ enum Active {
     Pan { last: [f32; 2] },
     ZoomRect { start: [f32; 2], end: [f32; 2], out: bool },
     Picker { secondary: bool },
+    LineDrag { idx: usize },
 }
 
 struct MoveSelectedState {
@@ -476,8 +508,28 @@ pub struct TextEdit {
     line_height: f32,
 }
 
+pub struct LineEdit {
+    sh: ShapeState,
+    pub selected: Option<usize>,
+    sig: (u32, bool, bool, bool),
+}
+
+struct WandLast {
+    doc_id: u64,
+    history_pos: usize,
+    at: (i32, i32),
+    base: Selection,
+    mode: CombineMode,
+    shift: bool,
+    sig: (u32, bool, SampleFrom),
+}
+
 pub struct Tools {
+    wand_last: Option<WandLast>,
     pub text: Option<TextEdit>,
+    pub line: Option<LineEdit>,
+    /// Hit radius for handles, in image pixels (set by the canvas each frame).
+    pub pick_radius: f32,
     pub text_params: crate::text::TextParams,
     pub current: ToolKind,
     pub previous: ToolKind,
@@ -504,7 +556,10 @@ pub enum ViewRequest {
 impl Default for Tools {
     fn default() -> Self {
         Tools {
+            wand_last: None,
             text: None,
+            line: None,
+            pick_radius: 6.0,
             text_params: crate::text::TextParams::default(),
             current: ToolKind::Paintbrush,
             previous: ToolKind::Paintbrush,
@@ -568,7 +623,7 @@ pub fn image_pixel(doc: &Document, x: i32, y: i32) -> [u8; 4] {
 
 impl Tools {
     pub fn is_busy(&self) -> bool {
-        !matches!(self.active, Active::None)
+        !matches!(self.active, Active::None) || self.line.is_some()
     }
 
     pub fn set_tool(&mut self, doc: Option<&mut Document>, t: ToolKind) {
@@ -584,6 +639,7 @@ impl Tools {
     /// Commit or cancel any in-progress gesture (e.g. when switching tools).
     pub fn finish(&mut self, doc: &mut Document) {
         self.commit_text(doc);
+        self.commit_line(doc);
         if !matches!(self.active, Active::None) {
             self.active = Active::None;
             doc.revert_uncommitted();
@@ -593,6 +649,7 @@ impl Tools {
     pub fn cancel(&mut self, doc: &mut Document) {
         self.active = Active::None;
         self.text = None;
+        self.line = None;
         doc.revert_uncommitted();
     }
 
@@ -631,11 +688,48 @@ impl Tools {
                     width: if pixel { 1.0 } else { s.brush_width },
                     aa: s.antialias && !pixel,
                     pixel,
+                    hardness: if pixel { 1.0 } else { (s.hardness / 100.0).clamp(0.0, 1.0) },
                 };
                 st.segment(doc, p.pos, p.pos);
                 self.active = Active::Stroke(st);
             }
-            ToolKind::Rectangle | ToolKind::RoundedRectangle | ToolKind::Ellipse | ToolKind::FreeformShape | ToolKind::LineCurve => {
+            ToolKind::LineCurve => {
+                let r = self.pick_radius;
+                if let Some(le) = self.line.as_mut() {
+                    let pts = &mut le.sh.points;
+                    // grab an existing point?
+                    if let Some(i) = (0..pts.len()).filter(|&i| dist(pts[i], p.pos) <= r).min_by(|&a, &b| dist(pts[a], p.pos).total_cmp(&dist(pts[b], p.pos))) {
+                        if p.secondary {
+                            if pts.len() > 2 {
+                                pts.remove(i);
+                                le.selected = None;
+                                self.render_line(doc);
+                            }
+                            return ViewRequest::None;
+                        }
+                        le.selected = Some(i);
+                        self.active = Active::LineDrag { idx: i };
+                        return ViewRequest::None;
+                    }
+                    // click on the curve inserts a point there
+                    if let Some(seg) = hit_curve(pts, p.pos, r.max(self.settings.brush_width / 2.0 + 1.0)) {
+                        pts.insert(seg + 1, p.pos);
+                        le.selected = Some(seg + 1);
+                        self.active = Active::LineDrag { idx: seg + 1 };
+                        self.render_line(doc);
+                        return ViewRequest::None;
+                    }
+                    self.status = "Drag points to edit, click the line to add a point, Enter to finish".into();
+                    return ViewRequest::None;
+                }
+                self.line = Some(LineEdit {
+                    sh: ShapeState { base: doc.state.layer().surface.clone(), start: p.pos, end: p.pos, points: vec![p.pos, p.pos], outline: primary, fill: secondary },
+                    selected: Some(1),
+                    sig: self.line_sig(),
+                });
+                self.active = Active::LineDrag { idx: 1 };
+            }
+            ToolKind::Rectangle | ToolKind::RoundedRectangle | ToolKind::Ellipse | ToolKind::FreeformShape => {
                 self.active = Active::Shape(ShapeState {
                     base: doc.state.layer().surface.clone(),
                     start: p.pos,
@@ -668,6 +762,7 @@ impl Tools {
                 let base = doc.state.selection.clone();
                 apply_selection(doc, &base, m, mode);
                 doc.commit("Magic Wand Select");
+                self.wand_last = Some(WandLast { doc_id: doc.id, history_pos: doc.history_pos, at: (x, y), base, mode, shift: p.shift, sig: (s.tolerance.to_bits(), s.flood_global, s.wand_from) });
                 self.status = format!("Magic wand: {:.0} ms", t0.elapsed().as_secs_f32() * 1000.0);
             }
             ToolKind::PaintBucket => {
@@ -891,6 +986,19 @@ impl Tools {
             }
             Active::ZoomRect { end, .. } => *end = p.pos,
             Active::Picker { .. } => pick = true,
+            Active::LineDrag { idx } => {
+                let idx = *idx;
+                if let Some(le) = self.line.as_mut() {
+                    let mut q = p.pos;
+                    if p.shift && idx > 0 {
+                        q = snap_angle(le.sh.points[idx - 1], q);
+                    }
+                    if let Some(pt) = le.sh.points.get_mut(idx) {
+                        *pt = q;
+                    }
+                }
+                self.render_line(doc);
+            }
         }
         if pick {
             self.pick(doc, pal, p);
@@ -974,6 +1082,18 @@ impl Tools {
                     ViewRequest::ZoomAt { factor: 2.0, at: p.pos }
                 };
             }
+            Active::LineDrag { .. } => {
+                // a click without dragging on an empty canvas makes no line
+                if let Some(le) = &self.line {
+                    let pts = &le.sh.points;
+                    if pts.len() == 2 && dist(pts[0], pts[1]) < 0.5 {
+                        self.line = None;
+                        doc.revert_uncommitted();
+                    } else {
+                        self.status = "Drag points to edit, click the line to add a point, Enter to finish".into();
+                    }
+                }
+            }
             Active::Picker { .. } => {
                 if self.settings.picker_switch_back {
                     self.current = self.previous;
@@ -1037,6 +1157,15 @@ impl Tools {
             }
             _ => {}
         }
+        if let Some(le) = &self.line {
+            for (i, q) in le.sh.points.iter().enumerate() {
+                let c = to_screen(*q);
+                let r = egui::Rect::from_center_size(c, egui::vec2(9.0, 9.0));
+                let fill = if le.selected == Some(i) { Color32::from_rgb(30, 90, 220) } else { Color32::WHITE };
+                painter.rect_filled(r, 1.0, fill);
+                painter.rect_stroke(r, 1.0, Stroke::new(1.0, Color32::BLACK), egui::StrokeKind::Inside);
+            }
+        }
         if let Some(te) = &self.text {
             let b = te.bounds;
             let r = egui::Rect::from_two_pos(to_screen([b.x as f32 - 2.0, b.y as f32 - 2.0]), to_screen([(b.right() + 2) as f32, (b.bottom() + 2) as f32]));
@@ -1099,7 +1228,13 @@ pub fn flatten(doc: &Document) -> Surface {
 fn render_shape(doc: &mut Document, kind: ToolKind, sh: &ShapeState, s: &ToolSettings) {
     let bw = s.brush_width.max(1.0);
     let mut pb = PathBuilder::new();
-    let (a, b) = (sh.start, sh.end);
+    let (a, b) = if kind == ToolKind::LineCurve && sh.points.len() >= 2 {
+        // arrow direction follows the last segment
+        let n = sh.points.len();
+        (sh.points[n - 2], sh.points[n - 1])
+    } else {
+        (sh.start, sh.end)
+    };
     let outline = s.fill_style != FillStyle::Fill || kind == ToolKind::LineCurve;
     let fill = s.fill_style != FillStyle::Outline && kind != ToolKind::LineCurve;
     // Inset outlines so they stay inside the dragged rectangle (as Pinta does).
@@ -1125,10 +1260,7 @@ fn render_shape(doc: &mut Document, kind: ToolKind, sh: &ShapeState, s: &ToolSet
             let rad = (s.radius).min(rw / 2.0).min(rh / 2.0).max(0.0);
             rounded_rect(&mut pb, x0, y0, rw, rh, rad);
         }
-        ToolKind::LineCurve => {
-            pb.move_to(a[0], a[1]);
-            pb.line_to(b[0], b[1]);
-        }
+        ToolKind::LineCurve => curve_path(&mut pb, &sh.points),
         ToolKind::FreeformShape => {
             pb.move_to(sh.points[0][0], sh.points[0][1]);
             for q in &sh.points[1..] {
@@ -1464,4 +1596,133 @@ fn floating_key(doc: &Document) -> (u64, u64, usize, usize) {
     let l = doc.state.layer();
     let m = doc.state.selection.mask.as_ref().map_or(0, |m| Arc::as_ptr(&m.tiles) as usize);
     (doc.id, l.id, Arc::as_ptr(&l.surface.tiles) as usize, m)
+}
+
+fn dist(a: [f32; 2], b: [f32; 2]) -> f32 {
+    ((a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2)).sqrt()
+}
+
+/// Catmull-Rom control points for segment i (p[i] -> p[i+1]) as cubic Bezier.
+fn seg_bezier(p: &[[f32; 2]], i: usize) -> ([f32; 2], [f32; 2], [f32; 2], [f32; 2]) {
+    let p0 = if i == 0 { p[0] } else { p[i - 1] };
+    let p1 = p[i];
+    let p2 = p[i + 1];
+    let p3 = if i + 2 < p.len() { p[i + 2] } else { p[i + 1] };
+    let c1 = [p1[0] + (p2[0] - p0[0]) / 6.0, p1[1] + (p2[1] - p0[1]) / 6.0];
+    let c2 = [p2[0] - (p3[0] - p1[0]) / 6.0, p2[1] - (p3[1] - p1[1]) / 6.0];
+    (p1, c1, c2, p2)
+}
+
+/// Smooth curve through all points (straight line for two points).
+fn curve_path(pb: &mut PathBuilder, p: &[[f32; 2]]) {
+    if p.is_empty() {
+        return;
+    }
+    pb.move_to(p[0][0], p[0][1]);
+    for i in 0..p.len().saturating_sub(1) {
+        let (_, c1, c2, e) = seg_bezier(p, i);
+        pb.cubic_to(c1[0], c1[1], c2[0], c2[1], e[0], e[1]);
+    }
+}
+
+/// Index of the segment whose curve passes within `r` of `q`.
+fn hit_curve(p: &[[f32; 2]], q: [f32; 2], r: f32) -> Option<usize> {
+    let mut best: Option<(usize, f32)> = None;
+    for i in 0..p.len().saturating_sub(1) {
+        let (a, b, c, d) = seg_bezier(p, i);
+        let at = |t: f32| {
+            let u = 1.0 - t;
+            let w = [u * u * u, 3.0 * u * u * t, 3.0 * u * t * t, t * t * t];
+            [w[0] * a[0] + w[1] * b[0] + w[2] * c[0] + w[3] * d[0], w[0] * a[1] + w[1] * b[1] + w[2] * c[1] + w[3] * d[1]]
+        };
+        let mut prev = at(0.0);
+        for k in 1..=32 {
+            let cur = at(k as f32 / 32.0);
+            // distance from q to segment prev-cur
+            let (vx, vy) = (cur[0] - prev[0], cur[1] - prev[1]);
+            let l2 = (vx * vx + vy * vy).max(1e-6);
+            let t = (((q[0] - prev[0]) * vx + (q[1] - prev[1]) * vy) / l2).clamp(0.0, 1.0);
+            let d = dist(q, [prev[0] + vx * t, prev[1] + vy * t]);
+            if d <= r && best.is_none_or(|b| d < b.1) {
+                best = Some((i, d));
+            }
+            prev = cur;
+        }
+    }
+    best.map(|b| b.0)
+}
+
+impl Tools {
+    fn line_sig(&self) -> (u32, bool, bool, bool) {
+        let s = &self.settings;
+        (s.brush_width.to_bits(), s.antialias, s.arrow, s.alpha_blending)
+    }
+
+    fn render_line(&mut self, doc: &mut Document) {
+        if let Some(le) = &self.line {
+            render_shape(doc, ToolKind::LineCurve, &le.sh, &self.settings);
+        }
+    }
+
+    /// Re-render the line being edited when its toolbar options change, and
+    /// redo the last magic-wand selection live when its tolerance/mode changes.
+    pub fn tick(&mut self, doc: &mut Document) {
+        let s = &self.settings;
+        let wsig = (s.tolerance.to_bits(), s.flood_global, s.wand_from);
+        if let Some(w) = self.wand_last.as_mut() {
+            let current = w.doc_id == doc.id && w.history_pos == doc.history_pos && doc.history.get(doc.history_pos).is_some_and(|h| h.label == "Magic Wand Select");
+            if !current {
+                self.wand_last = None;
+            } else if w.sig != wsig {
+                w.sig = wsig;
+                let src = match s.wand_from {
+                    SampleFrom::Layer => doc.state.layer().surface.clone(),
+                    SampleFrom::Image => flatten(doc),
+                };
+                let m = fill_mask(&src, w.at.0, w.at.1, s.tolerance, s.flood_global || w.shift, &Selection::default());
+                let base = w.base.clone();
+                apply_selection(doc, &base, m, w.mode);
+                // replace the wand's history step instead of adding new ones
+                doc.history[doc.history_pos].state = doc.state.clone();
+            }
+        }
+        let sig = self.line_sig();
+        if let Some(le) = self.line.as_mut() {
+            if le.sig != sig {
+                le.sig = sig;
+                self.render_line(doc);
+            }
+        }
+    }
+
+    pub fn line_editing(&self) -> bool {
+        self.line.is_some()
+    }
+
+    /// Enter: write the line into the layer as one history step.
+    pub fn commit_line(&mut self, doc: &mut Document) {
+        if let Some(le) = self.line.take() {
+            self.active = Active::None;
+            self.status.clear();
+            let n = le.sh.points.len();
+            if n >= 2 && (0..n - 1).any(|i| dist(le.sh.points[i], le.sh.points[i + 1]) >= 0.5) {
+                doc.commit("Line/Curve");
+            } else {
+                doc.revert_uncommitted();
+            }
+        }
+    }
+
+    /// Delete key: remove the selected point (keeps at least two).
+    pub fn delete_line_point(&mut self, doc: &mut Document) {
+        if let Some(le) = self.line.as_mut() {
+            if let Some(i) = le.selected {
+                if le.sh.points.len() > 2 {
+                    le.sh.points.remove(i);
+                    le.selected = None;
+                    self.render_line(doc);
+                }
+            }
+        }
+    }
 }

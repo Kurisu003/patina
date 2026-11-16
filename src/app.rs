@@ -518,6 +518,18 @@ impl App {
         if typing || self.busy() {
             return;
         }
+        // Line/Curve editing: Enter confirms, Delete removes the selected point
+        if self.tools.line_editing() {
+            let tools = &mut self.tools;
+            if let Some(d) = self.docs.get_mut(self.active) {
+                if sc(Modifiers::NONE, Key::Enter) {
+                    tools.commit_line(d);
+                }
+                if sc(Modifiers::NONE, Key::Delete) || sc(Modifiers::NONE, Key::Backspace) {
+                    tools.delete_line_point(d);
+                }
+            }
+        }
         // egui-winit turns Ctrl+X/C/V into Cut/Copy/Paste events instead of
         // key presses, so handle those (and swallow them) here.
         let clip: Vec<u8> = ctx.input_mut(|i| {
@@ -1072,6 +1084,10 @@ impl App {
                 ui.label("Brush width:");
                 ui.add(egui::DragValue::new(&mut s.brush_width).range(1.0..=1000.0).speed(0.25));
             }
+            if matches!(t, ToolKind::Paintbrush | ToolKind::Eraser | ToolKind::CloneStamp) {
+                ui.label("Hardness:");
+                ui.add(egui::Slider::new(&mut s.hardness, 0.0..=100.0).suffix("%").integer());
+            }
             if matches!(t, ToolKind::Paintbrush | ToolKind::Eraser | ToolKind::LineCurve | ToolKind::Rectangle | ToolKind::RoundedRectangle | ToolKind::Ellipse | ToolKind::FreeformShape | ToolKind::CloneStamp) {
                 ui.checkbox(&mut s.antialias, "Antialiasing");
             }
@@ -1526,6 +1542,8 @@ impl App {
         let rc = rect.center();
         let to_img = move |p: Pos2| [center[0] + (p.x - rc.x) / z, center[1] + (p.y - rc.y) / z];
         self.cursor = hover.filter(|h| rect.contains(*h)).map(to_img);
+        self.tools.pick_radius = 7.0 / z;
+        self.tools.tick(doc);
         let modal = !matches!(self.dialog, Dialog::None) || self.palette_edit.is_some();
         if self.job.is_none() && !modal {
             let pointer = |p: Pos2, secondary: bool| Pointer { pos: to_img(p), screen: [p.x, p.y], secondary, shift: mods.shift, ctrl: mods.command, alt: mods.alt };
@@ -1800,49 +1818,90 @@ impl App {
             }
             Dialog::CanvasSize { pct, percent, w, h, keep, anchor } => {
                 let (ow, oh) = self.docs.get(self.active).map_or((1, 1), |d| (d.state.width, d.state.height));
+                let icons = &self.icons;
                 egui::Window::new("Resize Canvas").collapsible(false).resizable(false).anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO).show(ctx, |ui| {
-                    ui.radio_value(pct, true, "By percentage:");
-                    ui.add_enabled(*pct, egui::DragValue::new(percent).range(1.0..=1000.0).suffix("%"));
-                    ui.radio_value(pct, false, "By absolute size:");
-                    ui.add_enabled_ui(!*pct, |ui| {
-                        ui.checkbox(keep, "Maintain aspect ratio");
-                        egui::Grid::new("cs").show(ui, |ui| {
-                            ui.label("Width:");
-                            if ui.add(egui::DragValue::new(w).range(1..=100_000)).changed() && *keep {
-                                *h = ((*w as f64 * oh as f64 / ow as f64).round() as u32).max(1);
-                            }
-                            ui.end_row();
-                            ui.label("Height:");
-                            if ui.add(egui::DragValue::new(h).range(1..=100_000)).changed() && *keep {
-                                *w = ((*h as f64 * ow as f64 / oh as f64).round() as u32).max(1);
-                            }
-                            ui.end_row();
+                    ui.spacing_mut().item_spacing = Vec2::new(8.0, 8.0);
+                    let (nw, nh) = if *pct { (((ow as f32 * *percent / 100.0).round() as u32).max(1), ((oh as f32 * *percent / 100.0).round() as u32).max(1)) } else { (*w, *h) };
+                    ui.horizontal(|ui| {
+                        // left column: size
+                        ui.vertical(|ui| {
+                            ui.strong("Size");
+                            ui.horizontal(|ui| {
+                                ui.radio_value(pct, true, "By percentage");
+                                ui.add_enabled(*pct, egui::DragValue::new(percent).range(1.0..=1000.0).suffix(" %").speed(0.5));
+                            });
+                            ui.radio_value(pct, false, "By absolute size");
+                            ui.add_enabled_ui(!*pct, |ui| {
+                                ui.indent("abs", |ui| {
+                                    egui::Grid::new("cs").num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
+                                        ui.label("Width");
+                                        if ui.add(egui::DragValue::new(w).range(1..=100_000).suffix(" px")).changed() && *keep {
+                                            *h = ((*w as f64 * oh as f64 / ow as f64).round() as u32).max(1);
+                                        }
+                                        ui.end_row();
+                                        ui.label("Height");
+                                        if ui.add(egui::DragValue::new(h).range(1..=100_000).suffix(" px")).changed() && *keep {
+                                            *w = ((*h as f64 * ow as f64 / oh as f64).round() as u32).max(1);
+                                        }
+                                        ui.end_row();
+                                    });
+                                    ui.checkbox(keep, "Maintain aspect ratio");
+                                });
+                            });
+                            ui.add_space(4.0);
+                            ui.weak(format!("Current: {ow} x {oh} px"));
+                            ui.weak(format!("New: {nw} x {nh} px"));
+                        });
+                        ui.separator();
+                        // right column: anchor grid + preview
+                        ui.vertical(|ui| {
+                            ui.strong("Anchor");
+                            let tint = ui.visuals().text_color();
+                            egui::Grid::new("anchor").spacing([3.0, 3.0]).show(ui, |ui| {
+                                for i in 0..9u8 {
+                                    let name = anchor_icon(i, *anchor);
+                                    let btn = match name.and_then(|n| icons.get(n)) {
+                                        Some(t) => egui::Button::image(egui::Image::new((t.id(), Vec2::splat(20.0))).tint(tint)),
+                                        None => egui::Button::new(""),
+                                    };
+                                    if ui.add(btn.selected(*anchor == i).min_size(Vec2::splat(38.0))).clicked() {
+                                        *anchor = i;
+                                    }
+                                    if i % 3 == 2 {
+                                        ui.end_row();
+                                    }
+                                }
+                            });
+                            // preview: old image placed inside the new canvas
+                            let (rect, _) = ui.allocate_exact_size(Vec2::new(120.0, 80.0), Sense::hover());
+                            let mw = nw.max(ow) as f32;
+                            let mh = nh.max(oh) as f32;
+                            let sc = (rect.width() / mw).min(rect.height() / mh);
+                            let c0 = rect.center() - Vec2::new(mw * sc, mh * sc) / 2.0;
+                            let canvas = Rect::from_min_size(c0 + Vec2::new((mw - nw as f32) / 2.0 * sc, (mh - nh as f32) / 2.0 * sc), Vec2::new(nw as f32 * sc, nh as f32 * sc));
+                            let (ax, ay) = ((*anchor % 3) as f32, (*anchor / 3) as f32);
+                            let img_min = canvas.min + Vec2::new((nw as f32 - ow as f32) * sc * ax / 2.0, (nh as f32 - oh as f32) * sc * ay / 2.0);
+                            let img = Rect::from_min_size(img_min, Vec2::new(ow as f32 * sc, oh as f32 * sc));
+                            let p = ui.painter();
+                            p.rect_filled(canvas, 2.0, ui.visuals().extreme_bg_color);
+                            p.rect_stroke(canvas, 2.0, (1.0, ui.visuals().weak_text_color()), egui::StrokeKind::Inside);
+                            p.rect_filled(img.intersect(canvas), 0.0, ui.visuals().selection.bg_fill.gamma_multiply(0.6));
+                            p.rect_stroke(img, 0.0, (1.0, ui.visuals().selection.stroke.color), egui::StrokeKind::Inside);
                         });
                     });
-                    ui.label("Anchor:");
-                    egui::Grid::new("anchor").spacing([2.0, 2.0]).show(ui, |ui| {
-                        for i in 0..9u8 {
-                            let arrows = ["NW", "N", "NE", "W", "C", "E", "SW", "S", "SE"];
-                            if ui.add(egui::Button::new(arrows[i as usize]).selected(*anchor == i).min_size(Vec2::splat(26.0))).clicked() {
-                                *anchor = i;
-                            }
-                            if i % 3 == 2 {
-                                ui.end_row();
-                            }
-                        }
-                    });
-                    ui.horizontal(|ui| {
-                        if ui.button("Cancel").clicked() {
-                            close = true;
-                        }
-                        if ui.button("OK").clicked() {
-                            let (nw, nh) = if *pct { (((ow as f32 * *percent / 100.0).round() as u32).max(1), ((oh as f32 * *percent / 100.0).round() as u32).max(1)) } else { (*w, *h) };
+                    ui.separator();
+                    let row = Vec2::new(ui.available_width(), ui.spacing().interact_size.y);
+                    ui.allocate_ui_with_layout(row, egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.add(egui::Button::new("  Resize  ").fill(ui.visuals().selection.bg_fill)).clicked() {
                             let a = *anchor;
                             act = Some(Box::new(move |app: &mut App| {
                                 if let Some(d) = app.doc() {
                                     ops::resize_canvas(d, nw, nh, a);
                                 }
                             }));
+                            close = true;
+                        }
+                        if ui.button("Cancel").clicked() {
                             close = true;
                         }
                     });
@@ -1987,6 +2046,26 @@ impl App {
     }
 }
 
+/// Pinta-style anchor grid icon: arrows point away from the anchor.
+fn anchor_icon(cell: u8, anchor: u8) -> Option<&'static str> {
+    let dx = (cell % 3) as i32 - (anchor % 3) as i32;
+    let dy = (cell / 3) as i32 - (anchor / 3) as i32;
+    if dx.abs() > 1 || dy.abs() > 1 {
+        return None;
+    }
+    Some(match (dx, dy) {
+        (0, 0) => "image-resize-canvas-base",
+        (0, -1) => "image-resize-canvas-up",
+        (0, 1) => "image-resize-canvas-down",
+        (-1, 0) => "image-resize-canvas-left",
+        (1, 0) => "image-resize-canvas-right",
+        (-1, -1) => "image-resize-canvas-nw",
+        (1, -1) => "image-resize-canvas-ne",
+        (-1, 1) => "image-resize-canvas-sw",
+        _ => "image-resize-canvas-se",
+    })
+}
+
 fn checker(p: &egui::Painter, r: Rect) {
     p.rect_filled(r, 0.0, Color32::WHITE);
     let s = 5.0;
@@ -2062,7 +2141,7 @@ impl eframe::App for App {
         egui::Panel::top("toolbar").show(ui, |ui| self.toolbar(ui));
         egui::Panel::bottom("status").show(ui, |ui| self.status_bar(ui));
         egui::Panel::bottom("palette").show(ui, |ui| self.palette_bar(ui));
-        egui::Panel::left("toolbox").resizable(false).exact_size(76.0).show(ui, |ui| {
+        egui::Panel::left("toolbox").resizable(false).exact_size(96.0).show(ui, |ui| {
             ui.add_space(4.0);
             self.toolbox(ui)
         });
