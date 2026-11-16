@@ -53,6 +53,10 @@ fn main() -> eframe::Result {
         renderer: eframe::Renderer::Wgpu,
         viewport: egui::ViewportBuilder::default().with_inner_size([1280.0, 860.0]).with_min_inner_size([640.0, 400.0]).with_title("Pinta-rs").with_app_id("pinta-rs").with_drag_and_drop(true),
         wgpu_options: egui_wgpu::WgpuConfiguration { wgpu_setup: egui_wgpu::WgpuSetup::CreateNew(setup), ..Default::default() },
+        // deliver Ctrl+X/C/V as plain keys: egui-winit's own paste drops the
+        // key when the clipboard holds only an image (its Wayland backend
+        // can't read images), so the app does clipboard handling itself
+        clipboard_shortcuts: false,
         ..Default::default()
     };
     eframe::run_native(

@@ -486,6 +486,11 @@ pub struct Tools {
     pub hover: Option<[f32; 2]>,
     clone_source: Option<(u64, [f32; 2])>,
     clone_offset: Option<[f32; 2]>,
+    /// Pixels lifted by Move Selected stay floating between drags (like
+    /// Pinta's selection layer) so moving them again never cuts holes in
+    /// the content they passed over. Keyed by (doc id, layer id, layer
+    /// tile table ptr, selection tile table ptr) to detect outside changes.
+    floating: Option<((u64, u64, usize, usize), Box<MoveSelectedState>)>,
     pub status: String,
 }
 
@@ -508,6 +513,7 @@ impl Default for Tools {
             hover: None,
             clone_source: None,
             clone_offset: None,
+            floating: None,
             status: String::new(),
         }
     }
@@ -707,6 +713,18 @@ impl Tools {
                 self.active = Active::MoveSelection { start: p.pos, base };
             }
             ToolKind::MoveSelected => {
+                // continue moving the still-floating pixels if nothing else touched the layer
+                if let Some((key, mut ms)) = self.floating.take() {
+                    if key == floating_key(doc) {
+                        let r = ms.lifted_rect;
+                        let c = [r.x as f32 + r.w as f32 / 2.0 + ms.offset[0], r.y as f32 + r.h as f32 / 2.0 + ms.offset[1]];
+                        ms.start = [p.pos[0] - ms.offset[0], p.pos[1] - ms.offset[1]];
+                        ms.rotating = p.secondary;
+                        ms.rot_start = (p.pos[1] - c[1]).atan2(p.pos[0] - c[0]) - ms.angle;
+                        self.active = Active::MoveSelected(ms);
+                        return ViewRequest::None;
+                    }
+                }
                 let mask = doc.state.selection.mask.clone().unwrap_or_else(|| Mask::full(w, h));
                 let Some(r) = mask.bounds() else { return ViewRequest::None };
                 let base = doc.state.layer().surface.clone();
@@ -930,7 +948,10 @@ impl Tools {
             }
             Active::MoveSelected(ms) => {
                 if ms.offset != [0.0, 0.0] || ms.angle != 0.0 {
-                    doc.commit("Move Selected");
+                    if doc.history[doc.history_pos].state.layers.get(doc.state.current).is_none_or(|l| !Arc::ptr_eq(&l.surface.tiles, &doc.state.layer().surface.tiles)) {
+                        doc.commit("Move Selected");
+                    }
+                    self.floating = Some((floating_key(doc), ms));
                 } else {
                     doc.revert_uncommitted();
                 }
@@ -1437,4 +1458,10 @@ impl Tools {
         }
         doc.state.layer_mut().surface = target;
     }
+}
+
+fn floating_key(doc: &Document) -> (u64, u64, usize, usize) {
+    let l = doc.state.layer();
+    let m = doc.state.selection.mask.as_ref().map_or(0, |m| Arc::as_ptr(&m.tiles) as usize);
+    (doc.id, l.id, Arc::as_ptr(&l.surface.tiles) as usize, m)
 }

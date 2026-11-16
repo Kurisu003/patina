@@ -728,6 +728,11 @@ impl App {
                     Key::Backspace => keys.push(TextKey::Backspace),
                     Key::Delete => keys.push(TextKey::Delete),
                     Key::Enter if modifiers.command => keys.push(TextKey::Commit),
+                    Key::V if modifiers.command_only() => {
+                        if let Some(t) = self.clipboard.as_mut().and_then(|c| c.get_text().ok()) {
+                            keys.push(TextKey::Insert(t.replace("\r\n", "\n")));
+                        }
+                    }
                     Key::Enter => keys.push(TextKey::Insert("\n".into())),
                     Key::ArrowLeft => keys.push(TextKey::Left),
                     Key::ArrowRight => keys.push(TextKey::Right),
@@ -2025,6 +2030,24 @@ impl eframe::App for App {
         let dropped: Vec<PathBuf> = ctx.input(|i| i.raw.dropped_files.iter().map(|f| f.path().to_path_buf()).filter(|p| !p.as_os_str().is_empty()).collect());
         for p in dropped {
             self.open_path(p);
+        }
+        // text widgets (layer name, hex colour...) still need Ctrl+X/C/V
+        if ctx.egui_wants_keyboard_input() {
+            let paste_text = self.clipboard.as_mut().and_then(|c| c.get_text().ok()).unwrap_or_default();
+            ctx.input_mut(|i| {
+                for e in i.events.iter_mut() {
+                    if let egui::Event::Key { key, pressed: true, modifiers, .. } = e {
+                        if modifiers.command_only() {
+                            match key {
+                                Key::C => *e = egui::Event::Copy,
+                                Key::X => *e = egui::Event::Cut,
+                                Key::V => *e = egui::Event::Paste(paste_text.clone()),
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+            });
         }
         self.poll_effect(&ctx);
         if matches!(self.dialog, Dialog::None) {
