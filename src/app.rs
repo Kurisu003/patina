@@ -42,7 +42,7 @@ struct EffectJob {
 
 enum Dialog {
     None,
-    Preferences { w: u32, h: u32, bg: u8, skin: Skin, keys: crate::tools::KeyBindings },
+    Preferences { w: u32, h: u32, bg: u8, skin: Skin, keys: crate::tools::KeyBindings, attached: bool },
     /// Clipboard image: paste into the current image or open as a new one.
     PasteChoice { w: u32, h: u32, data: Arc<Vec<u8>>, fit: ops::PasteFit },
     /// Files dropped onto the window while an image is open.
@@ -145,6 +145,8 @@ struct Prefs {
     bg: u8,
     /// Tool modifier keys.
     keys: crate::tools::KeyBindings,
+    /// Paint.NET skins: pin Tools/Colors/Layers/History to the canvas corners.
+    windows_attached: bool,
 }
 
 impl Prefs {
@@ -152,7 +154,7 @@ impl Prefs {
         std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config/patina/prefs"))
     }
     fn load() -> Prefs {
-        let mut p = Prefs { w: 800, h: 600, bg: 0, keys: Default::default() };
+        let mut p = Prefs { w: 800, h: 600, bg: 0, keys: Default::default(), windows_attached: false };
         let text = Self::path().and_then(|f| std::fs::read_to_string(f).ok()).unwrap_or_default();
         for line in text.lines() {
             let Some((k, v)) = line.split_once('=') else { continue };
@@ -161,6 +163,7 @@ impl Prefs {
                 "canvas_width" => p.w = v.parse().unwrap_or(p.w).clamp(1, 100_000),
                 "canvas_height" => p.h = v.parse().unwrap_or(p.h).clamp(1, 100_000),
                 "canvas_background" => p.bg = v.parse().unwrap_or(p.bg).min(2),
+                "windows_attached" => p.windows_attached = v == "1" || v == "true",
                 k => {
                     for (id, _, slot) in p.keys.entries() {
                         if id == k {
@@ -177,7 +180,7 @@ impl Prefs {
     fn save(self) {
         if let Some(f) = Self::path() {
             let _ = std::fs::create_dir_all(f.parent().unwrap());
-            let mut text = format!("canvas_width={}\ncanvas_height={}\ncanvas_background={}\n", self.w, self.h, self.bg);
+            let mut text = format!("canvas_width={}\ncanvas_height={}\ncanvas_background={}\nwindows_attached={}\n", self.w, self.h, self.bg, self.windows_attached as u8);
             let mut keys = self.keys;
             for (id, _, m) in keys.entries() {
                 text.push_str(&format!("{id}={}\n", m.id()));
@@ -1070,7 +1073,7 @@ impl App {
                 ui.separator();
                 if ui.button("Preferences...").clicked() {
                     let p = self.prefs;
-                    self.dialog = Dialog::Preferences { w: p.w, h: p.h, bg: p.bg, skin: self.skin, keys: p.keys };
+                    self.dialog = Dialog::Preferences { w: p.w, h: p.h, bg: p.bg, skin: self.skin, keys: p.keys, attached: p.windows_attached };
                 }
             });
             ui.menu_button("View", |ui| {
@@ -1212,6 +1215,10 @@ impl App {
                     ui.checkbox(&mut self.win_history, "History  (F6)");
                     ui.checkbox(&mut self.win_layers, "Layers  (F7)");
                     ui.checkbox(&mut self.win_colors, "Colors  (F8)");
+                    ui.separator();
+                    if ui.checkbox(&mut self.prefs.windows_attached, "Windows attached").changed() {
+                        self.prefs.save();
+                    }
                     if ui.button("Reset Window Positions").clicked() {
                         ui.ctx().memory_mut(|m| m.reset_areas());
                     }
@@ -1964,13 +1971,16 @@ impl App {
         let mut act: Option<Box<dyn FnOnce(&mut App)>> = None;
         match &mut self.dialog {
             Dialog::None => {}
-            Dialog::Preferences { w, h, bg, skin, keys } => {
+            Dialog::Preferences { w, h, bg, skin, keys, attached } => {
                 egui::Window::new("Preferences").collapsible(false).resizable(false).anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO).order(egui::Order::Foreground).show(ctx, |ui| {
                     ui.strong("Appearance");
                     ui.horizontal(|ui| {
                         ui.radio_value(skin, Skin::Pinta, "Pinta");
                         ui.radio_value(skin, Skin::Classic, "Paint.NET light");
                         ui.radio_value(skin, Skin::ClassicDark, "Paint.NET dark");
+                    });
+                    ui.add_enabled_ui(skin.is_classic(), |ui| {
+                        ui.checkbox(attached, "Windows attached").on_hover_text("Paint.NET skins: Tools top left, Colors bottom left, Layers bottom right, History top right");
                     });
                     ui.separator();
                     ui.strong("Default canvas");
@@ -2023,7 +2033,7 @@ impl App {
                             close = true;
                         }
                         if ui.add(egui::Button::new("Save").fill(ui.visuals().selection.bg_fill)).clicked() {
-                            let p = Prefs { w: *w, h: *h, bg: *bg, keys: *keys };
+                            let p = Prefs { w: *w, h: *h, bg: *bg, keys: *keys, windows_attached: *attached };
                             let sk = *skin;
                             act = Some(Box::new(move |app: &mut App| {
                                 app.prefs = p;
@@ -2549,17 +2559,26 @@ impl App {
             return;
         }
         let m = 10.0;
+        let attached = self.prefs.windows_attached;
+        // attached: pinned to the canvas corners; otherwise free (positions remembered)
+        let place = |w: egui::Window<'static>, corner: egui::Align2, at: Pos2, free: Pos2| -> egui::Window<'static> {
+            if attached { w.pivot(corner).fixed_pos(at) } else { w.default_pos(free) }
+        };
         let mut open = self.win_tools;
-        egui::Window::new("Tools").id(egui::Id::new("c_tools")).open(&mut open).auto_sized().collapsible(false).default_pos(area.left_top() + Vec2::new(m, m)).show(ctx, |ui| self.toolbox(ui));
+        let w = egui::Window::new("Tools").id(egui::Id::new("c_tools")).auto_sized().collapsible(false);
+        place(w, egui::Align2::LEFT_TOP, area.left_top() + Vec2::new(m, m), area.left_top() + Vec2::new(m, m)).open(&mut open).show(ctx, |ui| self.toolbox(ui));
         self.win_tools = open;
         let mut open = self.win_history;
-        egui::Window::new("History").id(egui::Id::new("c_history")).open(&mut open).collapsible(false).default_size([200.0, 230.0]).default_pos(area.right_top() + Vec2::new(-210.0 - m, m)).show(ctx, |ui| self.history_panel(ui));
+        let w = egui::Window::new("History").id(egui::Id::new("c_history")).collapsible(false).default_size([200.0, 230.0]);
+        place(w, egui::Align2::RIGHT_TOP, area.right_top() + Vec2::new(-m, m), area.right_top() + Vec2::new(-210.0 - m, m)).open(&mut open).show(ctx, |ui| self.history_panel(ui));
         self.win_history = open;
         let mut open = self.win_layers;
-        egui::Window::new("Layers").id(egui::Id::new("c_layers")).open(&mut open).collapsible(false).default_size([230.0, 260.0]).default_pos(area.right_bottom() + Vec2::new(-240.0 - m, -300.0 - m)).show(ctx, |ui| self.layers_panel(ui));
+        let w = egui::Window::new("Layers").id(egui::Id::new("c_layers")).collapsible(false).default_size([230.0, 260.0]);
+        place(w, egui::Align2::RIGHT_BOTTOM, area.right_bottom() + Vec2::new(-m, -m), area.right_bottom() + Vec2::new(-240.0 - m, -300.0 - m)).open(&mut open).show(ctx, |ui| self.layers_panel(ui));
         self.win_layers = open;
         let mut open = self.win_colors;
-        egui::Window::new("Colors").id(egui::Id::new("c_colors")).open(&mut open).auto_sized().collapsible(false).default_pos(area.left_bottom() + Vec2::new(m, -265.0 - m)).show(ctx, |ui| self.colors_window(ui));
+        let w = egui::Window::new("Colors").id(egui::Id::new("c_colors")).auto_sized().collapsible(false);
+        place(w, egui::Align2::LEFT_BOTTOM, area.left_bottom() + Vec2::new(m, -m), area.left_bottom() + Vec2::new(m, -265.0 - m)).open(&mut open).show(ctx, |ui| self.colors_window(ui));
         self.win_colors = open;
     }
 
