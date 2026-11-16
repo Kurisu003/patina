@@ -2346,13 +2346,18 @@ impl App {
 /// Size options for pasting into the current image or a new layer.
 fn fit_choice(ui: &mut egui::Ui, fit: &mut ops::PasteFit, (w, h): (u32, u32), (cw, ch): (u32, u32)) {
     use ops::PasteFit::*;
+    // only ask when the picture does not fit; otherwise paste it as is
+    if w <= cw && h <= ch {
+        *fit = Keep;
+        return;
+    }
     egui::Frame::group(ui.style()).show(ui, |ui| {
-        ui.label(format!("When pasting into this image ({cw} x {ch}), the {w} x {h} picture should:"));
+        ui.label(format!("The {w} x {h} picture is larger than this image ({cw} x {ch}). It should:"));
         let ew = cw.max(w);
         let eh = ch.max(h);
         let cut = |fits: bool| if fits { "" } else { ", overhang cut off" };
         ui.radio_value(fit, Expand, format!("Expand the canvas to fit  ({ew} x {eh})"));
-        ui.radio_value(fit, Keep, format!("Keep the canvas size  ({cw} x {ch}{})", cut(w <= cw && h <= ch)));
+        ui.radio_value(fit, Keep, format!("Keep the canvas size  ({cw} x {ch}, overhang cut off)"));
         let wh = ((h as f64 * cw as f64 / w.max(1) as f64).round() as u32).max(1);
         ui.radio_value(fit, Width, format!("Scale to the canvas width  (picture {cw} x {wh}{})", cut(wh <= ch)));
         let hw = ((w as f64 * ch as f64 / h.max(1) as f64).round() as u32).max(1);
