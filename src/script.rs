@@ -148,9 +148,23 @@ impl Script {
             "copy" => raw.events.push(Event::Copy),
             "cut" => raw.events.push(Event::Cut),
             "paste" => raw.events.push(Event::Paste(String::new())),
+            "drop" => raw.dropped_files.push(std::sync::Arc::new(ScriptFile(std::path::PathBuf::from(rest)))),
             "log" => println!("script: {rest}"),
             "quit" => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
             _ => println!("script: unknown command {line}"),
         }
+    }
+}
+
+/// A file "dropped" by a script.
+#[derive(Debug)]
+struct ScriptFile(std::path::PathBuf);
+
+impl egui::DroppedFile for ScriptFile {
+    fn path(&self) -> &std::path::Path {
+        &self.0
+    }
+    fn bytes(&self) -> Result<Vec<u8>, String> {
+        std::fs::read(&self.0).map_err(|e| e.to_string())
     }
 }

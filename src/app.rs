@@ -42,6 +42,10 @@ struct EffectJob {
 
 enum Dialog {
     None,
+    /// Clipboard image: paste into the current image or open as a new one.
+    PasteChoice { w: u32, h: u32, data: Arc<Vec<u8>> },
+    /// Files dropped onto the window while an image is open.
+    DropChoice { paths: Vec<PathBuf> },
     NewImage { w: u32, h: u32, bg: u8 },
     ResizeImage { pct: bool, percent: f32, w: u32, h: u32, keep: bool, mode: ops::Resample },
     CanvasSize { pct: bool, percent: f32, w: u32, h: u32, keep: bool, anchor: u8 },
@@ -430,10 +434,19 @@ impl App {
             let c = crate::surface::premul([p[0], p[1], p[2], p[3]]);
             p.copy_from_slice(&c);
         }
+        if target == 0 && !self.docs.is_empty() {
+            self.dialog = Dialog::PasteChoice { w, h, data: Arc::new(data) };
+            return;
+        }
+        self.paste_data(w, h, &data, target, "Paste Into New Image");
+    }
+
+    /// Place premultiplied pixels: 0 = current layer, 1 = new layer, 2 = new image.
+    fn paste_data(&mut self, w: u32, h: u32, data: &[u8], target: u8, new_label: &str) {
         if target == 2 || self.docs.is_empty() {
             let s = Surface::from_rgba(w, h, &data);
             let n = self.docs.len() + 1;
-            let mut d = Document::from_layers(format!("Unsaved Image {n}"), w, h, vec![crate::document::Layer::new("Background", s)], "Paste Into New Image");
+            let mut d = Document::from_layers(format!("Unsaved Image {n}"), w, h, vec![crate::document::Layer::new("Background", s)], new_label);
             d.clean_pos = None;
             self.docs.push(d);
             self.active = self.docs.len() - 1;
@@ -443,7 +456,7 @@ impl App {
         let at = self.visible_origin(&self.docs[self.active]);
         let doc = &mut self.docs[self.active];
         self.tools.finish(doc);
-        ops::paste(doc, w, h, &data, at, target == 1);
+        ops::paste(doc, w, h, data, at, target == 1);
         self.tools.set_tool(None, ToolKind::MoveSelected);
     }
 
@@ -1370,7 +1383,7 @@ impl App {
         if let Some(primary) = self.palette_edit {
             let mut open = true;
             let mut col = c32(if primary { self.palette.primary } else { self.palette.secondary });
-            egui::Window::new(if primary { "Primary Color" } else { "Secondary Color" }).open(&mut open).collapsible(false).resizable(false).show(ui.ctx(), |ui| {
+            egui::Window::new(if primary { "Primary Color" } else { "Secondary Color" }).open(&mut open).collapsible(false).resizable(false).order(egui::Order::Foreground).show(ui.ctx(), |ui| {
                 egui::color_picker::color_picker_color32(ui, &mut col, egui::color_picker::Alpha::OnlyBlend);
                 let mut hex = format!("{:02X}{:02X}{:02X}{:02X}", col.r(), col.g(), col.b(), col.a());
                 ui.horizontal(|ui| {
@@ -1556,6 +1569,9 @@ impl App {
     fn canvas(&mut self, ui: &mut egui::Ui) {
         // tabs
         if self.docs.len() > 1 {
+            let fill = ui.visuals().panel_fill;
+            egui::Frame::new().fill(fill).inner_margin(egui::Margin::symmetric(6, 3)).show(ui, |ui| {
+            ui.set_width(ui.available_width());
             ui.horizontal(|ui| {
                 let mut close = None;
                 for (i, d) in self.docs.iter().enumerate() {
@@ -1571,6 +1587,8 @@ impl App {
                     self.close_doc(i, false);
                 }
             });
+            });
+            ui.add_space(-ui.spacing().item_spacing.y);
         }
         let (rect, resp) = ui.allocate_exact_size(ui.available_size(), Sense::click_and_drag());
         // the canvas must never hold keyboard focus, or tool shortcuts and
@@ -1768,7 +1786,7 @@ impl App {
 
     fn dialogs(&mut self, ctx: &egui::Context) {
         if let Some(e) = self.error.clone() {
-            egui::Window::new("Error").collapsible(false).resizable(false).anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO).show(ctx, |ui| {
+            egui::Window::new("Error").collapsible(false).resizable(false).anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO).order(egui::Order::Foreground).show(ctx, |ui| {
                 ui.label(e);
                 if ui.button("OK").clicked() {
                     self.error = None;
@@ -1779,7 +1797,7 @@ impl App {
         let mut effect_action = 0; // 1 ok, 2 cancel, 3 rerender
         if let Some(job) = self.job.as_mut() {
             if job.dialog {
-                egui::Window::new(job.effect.name()).collapsible(false).resizable(false).anchor(egui::Align2::RIGHT_TOP, Vec2::new(-260.0, 80.0)).show(ctx, |ui| {
+                egui::Window::new(job.effect.name()).collapsible(false).resizable(false).anchor(egui::Align2::RIGHT_TOP, Vec2::new(-260.0, 80.0)).order(egui::Order::Foreground).show(ctx, |ui| {
                     ui.set_min_width(280.0);
                     if job.effect.ui(ui) {
                         effect_action = 3;
@@ -1814,7 +1832,7 @@ impl App {
         match &mut self.dialog {
             Dialog::None => {}
             Dialog::NewImage { w, h, bg } => {
-                egui::Window::new("New Image").collapsible(false).resizable(false).anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO).show(ctx, |ui| {
+                egui::Window::new("New Image").collapsible(false).resizable(false).anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO).order(egui::Order::Foreground).show(ctx, |ui| {
                     egui::Grid::new("ni").num_columns(2).show(ui, |ui| {
                         ui.label("Width:");
                         ui.add(egui::DragValue::new(w).range(1..=100_000).suffix(" px"));
@@ -1862,7 +1880,7 @@ impl App {
             }
             Dialog::ResizeImage { pct, percent, w, h, keep, mode } => {
                 let (ow, oh) = self.docs.get(self.active).map_or((1, 1), |d| (d.state.width, d.state.height));
-                egui::Window::new("Resize Image").collapsible(false).resizable(false).anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO).show(ctx, |ui| {
+                egui::Window::new("Resize Image").collapsible(false).resizable(false).anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO).order(egui::Order::Foreground).show(ctx, |ui| {
                     ui.radio_value(pct, true, "By percentage:");
                     ui.add_enabled(*pct, egui::DragValue::new(percent).range(1.0..=1000.0).suffix("%"));
                     ui.radio_value(pct, false, "By absolute size:");
@@ -1906,7 +1924,7 @@ impl App {
             Dialog::CanvasSize { pct, percent, w, h, keep, anchor } => {
                 let (ow, oh) = self.docs.get(self.active).map_or((1, 1), |d| (d.state.width, d.state.height));
                 let icons = &self.icons;
-                egui::Window::new("Resize Canvas").collapsible(false).resizable(false).anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO).show(ctx, |ui| {
+                egui::Window::new("Resize Canvas").collapsible(false).resizable(false).anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO).order(egui::Order::Foreground).show(ctx, |ui| {
                     ui.spacing_mut().item_spacing = Vec2::new(8.0, 8.0);
                     let (nw, nh) = if *pct { (((ow as f32 * *percent / 100.0).round() as u32).max(1), ((oh as f32 * *percent / 100.0).round() as u32).max(1)) } else { (*w, *h) };
                     ui.horizontal(|ui| {
@@ -1998,7 +2016,7 @@ impl App {
                 let mut changed = false;
                 let mut ok = false;
                 let mut cancel = false;
-                egui::Window::new("Layer Properties").collapsible(false).resizable(false).anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO).show(ctx, |ui| {
+                egui::Window::new("Layer Properties").collapsible(false).resizable(false).anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO).order(egui::Order::Foreground).show(ctx, |ui| {
                     egui::Grid::new("lp").num_columns(2).show(ui, |ui| {
                         ui.label("Name:");
                         changed |= ui.text_edit_singleline(name).changed();
@@ -2052,8 +2070,78 @@ impl App {
                     }
                 }
             }
+            Dialog::PasteChoice { w, h, data } => {
+                let (w, h, data) = (*w, *h, data.clone());
+                let name = self.docs.get(self.active).map(|d| d.display_name()).unwrap_or_default();
+                egui::Window::new("Paste Image").collapsible(false).resizable(false).anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO).order(egui::Order::Foreground).show(ctx, |ui| {
+                    ui.label(format!("Paste the {w} x {h} clipboard image where?"));
+                    ui.add_space(6.0);
+                    let mut choice = None;
+                    ui.horizontal(|ui| {
+                        if ui.add(egui::Button::new(format!("Into \"{name}\"")).fill(ui.visuals().selection.bg_fill)).on_hover_text("Paste onto the current layer (Enter)").clicked() || ui.input(|i| i.key_pressed(Key::Enter)) {
+                            choice = Some(0u8);
+                        }
+                        if ui.button("Into a new layer").clicked() {
+                            choice = Some(1);
+                        }
+                        if ui.button("As a new image").on_hover_text("Open in a new tab").clicked() {
+                            choice = Some(2);
+                        }
+                        if ui.button("Cancel").clicked() || ui.input(|i| i.key_pressed(Key::Escape)) {
+                            close = true;
+                        }
+                    });
+                    if let Some(t) = choice {
+                        act = Some(Box::new(move |app: &mut App| app.paste_data(w, h, &data, t, "Paste Into New Image")));
+                        close = true;
+                    }
+                });
+            }
+            Dialog::DropChoice { paths } => {
+                let paths = paths.clone();
+                let name = self.docs.get(self.active).map(|d| d.display_name()).unwrap_or_default();
+                let what = if paths.len() == 1 { paths[0].file_name().map(|f| f.to_string_lossy().to_string()).unwrap_or_default() } else { format!("{} files", paths.len()) };
+                egui::Window::new("Dropped Image").collapsible(false).resizable(false).anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO).order(egui::Order::Foreground).show(ctx, |ui| {
+                    ui.label(format!("What should happen with {what}?"));
+                    ui.add_space(6.0);
+                    let mut choice = None;
+                    ui.horizontal(|ui| {
+                        if ui.add(egui::Button::new("Open in new tab").fill(ui.visuals().selection.bg_fill)).on_hover_text("Enter").clicked() || ui.input(|i| i.key_pressed(Key::Enter)) {
+                            choice = Some(2u8);
+                        }
+                        if ui.button(format!("Paste into \"{name}\"")).clicked() {
+                            choice = Some(0);
+                        }
+                        if ui.button("Paste as new layer").clicked() {
+                            choice = Some(1);
+                        }
+                        if ui.button("Cancel").clicked() || ui.input(|i| i.key_pressed(Key::Escape)) {
+                            close = true;
+                        }
+                    });
+                    if let Some(t) = choice {
+                        act = Some(Box::new(move |app: &mut App| {
+                            for p in paths {
+                                if t == 2 {
+                                    app.open_path(p);
+                                    continue;
+                                }
+                                match crate::io::load(&p) {
+                                    Ok(d) => {
+                                        let (w, h) = (d.state.width, d.state.height);
+                                        let data = crate::tools::flatten(&d).read_rect(IRect::new(0, 0, w as i32, h as i32));
+                                        app.paste_data(w, h, &data, t, "Open Image");
+                                    }
+                                    Err(e) => app.error = Some(e),
+                                }
+                            }
+                        }));
+                        close = true;
+                    }
+                });
+            }
             Dialog::Jpeg { path, quality } => {
-                egui::Window::new("JPEG Quality").collapsible(false).resizable(false).anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO).show(ctx, |ui| {
+                egui::Window::new("JPEG Quality").collapsible(false).resizable(false).anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO).order(egui::Order::Foreground).show(ctx, |ui| {
                     ui.add(egui::Slider::new(quality, 1..=100).text("Quality"));
                     ui.horizontal(|ui| {
                         if ui.button("Cancel").clicked() {
@@ -2073,7 +2161,7 @@ impl App {
             Dialog::ConfirmClose { doc, quit } => {
                 let name = self.docs.get(*doc).map(|d| d.title.clone()).unwrap_or_default();
                 let (doc, quit) = (*doc, *quit);
-                egui::Window::new("Save changes?").collapsible(false).resizable(false).anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO).show(ctx, |ui| {
+                egui::Window::new("Save changes?").collapsible(false).resizable(false).anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO).order(egui::Order::Foreground).show(ctx, |ui| {
                     ui.label(format!("Save changes to \"{name}\" before closing?"));
                     ui.horizontal(|ui| {
                         if ui.button("Close without saving").clicked() {
@@ -2105,7 +2193,7 @@ impl App {
                 });
             }
             Dialog::About => {
-                egui::Window::new("About Pinta-rs").collapsible(false).resizable(false).anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO).show(ctx, |ui| {
+                egui::Window::new("About Pinta-rs").collapsible(false).resizable(false).anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO).order(egui::Order::Foreground).show(ctx, |ui| {
                     ui.heading("Pinta-rs");
                     ui.label("A Rust port of Pinta with a tiled, GPU-rendered canvas.");
                     ui.label("Based on Pinta (MIT License), which is based on Paint.NET 3.36 (MIT License).");
@@ -2429,8 +2517,14 @@ impl eframe::App for App {
         }
         // drag and drop files
         let dropped: Vec<PathBuf> = ctx.input(|i| i.raw.dropped_files.iter().map(|f| f.path().to_path_buf()).filter(|p| !p.as_os_str().is_empty()).collect());
-        for p in dropped {
-            self.open_path(p);
+        if !dropped.is_empty() {
+            if self.docs.is_empty() {
+                for p in dropped {
+                    self.open_path(p);
+                }
+            } else {
+                self.dialog = Dialog::DropChoice { paths: dropped };
+            }
         }
         // text widgets (layer name, hex colour...) still need Ctrl+X/C/V
         if ctx.egui_wants_keyboard_input() {
