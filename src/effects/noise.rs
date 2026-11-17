@@ -226,11 +226,137 @@ pub struct AddNoise {
     /// Percent of pixels affected.
     pub coverage: f64,
     pub seed: u32,
+    pub kind: NoiseKind,
+    /// Feature size in pixels (1 = per-pixel grain).
+    pub size: f32,
+    /// Fractal layers for Perlin / Value noise.
+    pub octaves: i32,
+}
+
+/// The pattern Add Noise adds.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum NoiseKind {
+    /// Paint.NET's per-pixel Gaussian grain.
+    Gaussian,
+    /// Evenly distributed random values.
+    Uniform,
+    /// Smooth gradient noise.
+    Perlin,
+    /// Smoothly interpolated random grid values.
+    Value,
+    /// Distance to the nearest random feature point (Worley).
+    Cellular,
+}
+
+impl NoiseKind {
+    const ALL: [NoiseKind; 5] = [NoiseKind::Gaussian, NoiseKind::Uniform, NoiseKind::Perlin, NoiseKind::Value, NoiseKind::Cellular];
+    fn name(self) -> &'static str {
+        match self {
+            NoiseKind::Gaussian => "Gaussian (grain)",
+            NoiseKind::Uniform => "Uniform",
+            NoiseKind::Perlin => "Perlin",
+            NoiseKind::Value => "Value",
+            NoiseKind::Cellular => "Cellular (Worley)",
+        }
+    }
+    fn fractal(self) -> bool {
+        matches!(self, NoiseKind::Perlin | NoiseKind::Value)
+    }
 }
 
 impl Default for AddNoise {
     fn default() -> Self {
-        AddNoise { intensity: 64, color_saturation: 100, coverage: 100.0, seed: 0 }
+        AddNoise { intensity: 64, color_saturation: 100, coverage: 100.0, seed: 0, kind: NoiseKind::Gaussian, size: 1.0, octaves: 4 }
+    }
+}
+
+#[inline]
+fn fade(t: f32) -> f32 {
+    t * t * t * (t * (t * 6.0 - 15.0) + 10.0)
+}
+
+/// Random value in [-1, 1] for a lattice point.
+#[inline]
+fn lattice(ix: i32, iy: i32, seed: u32) -> f32 {
+    (hash3(ix, iy, seed) >> 8) as f32 / (1u32 << 23) as f32 - 1.0
+}
+
+/// Gradient noise in roughly [-1, 1].
+fn perlin(x: f32, y: f32, seed: u32) -> f32 {
+    let (x0, y0) = (x.floor(), y.floor());
+    let (fx, fy) = (x - x0, y - y0);
+    let (ix, iy) = (x0 as i32, y0 as i32);
+    let grad = |gx: i32, gy: i32, dx: f32, dy: f32| {
+        let a = (hash3(gx, gy, seed) >> 8) as f32 / (1u32 << 24) as f32 * std::f32::consts::TAU;
+        a.cos() * dx + a.sin() * dy
+    };
+    let n00 = grad(ix, iy, fx, fy);
+    let n10 = grad(ix + 1, iy, fx - 1.0, fy);
+    let n01 = grad(ix, iy + 1, fx, fy - 1.0);
+    let n11 = grad(ix + 1, iy + 1, fx - 1.0, fy - 1.0);
+    let (u, v) = (fade(fx), fade(fy));
+    let a = n00 + (n10 - n00) * u;
+    let b = n01 + (n11 - n01) * u;
+    (a + (b - a) * v) * 1.414
+}
+
+/// Smoothly interpolated lattice values in [-1, 1].
+fn value_noise(x: f32, y: f32, seed: u32) -> f32 {
+    let (x0, y0) = (x.floor(), y.floor());
+    let (u, v) = (fade(x - x0), fade(y - y0));
+    let (ix, iy) = (x0 as i32, y0 as i32);
+    let a = lattice(ix, iy, seed) + (lattice(ix + 1, iy, seed) - lattice(ix, iy, seed)) * u;
+    let b = lattice(ix, iy + 1, seed) + (lattice(ix + 1, iy + 1, seed) - lattice(ix, iy + 1, seed)) * u;
+    a + (b - a) * v
+}
+
+/// Distance to the nearest feature point (one per cell), mapped to [-1, 1].
+fn cellular(x: f32, y: f32, seed: u32) -> f32 {
+    let (cx, cy) = (x.floor() as i32, y.floor() as i32);
+    let mut best = f32::MAX;
+    for oy in -1..=1 {
+        for ox in -1..=1 {
+            let (gx, gy) = (cx + ox, cy + oy);
+            let h = hash3(gx, gy, seed);
+            let px = gx as f32 + (h & 0xffff) as f32 / 65536.0;
+            let py = gy as f32 + (h >> 16) as f32 / 65536.0;
+            best = best.min((px - x).powi(2) + (py - y).powi(2));
+        }
+    }
+    (best.sqrt() * 1.6).min(1.0) * 2.0 - 1.0
+}
+
+/// Sum of `octaves` layers of `f`, each half the size and amplitude.
+fn fractal(f: fn(f32, f32, u32) -> f32, x: f32, y: f32, seed: u32, octaves: i32) -> f32 {
+    let (mut sum, mut amp, mut freq, mut norm) = (0.0, 1.0, 1.0, 0.0);
+    for o in 0..octaves.max(1) {
+        sum += f(x * freq, y * freq, seed.wrapping_add(o as u32 * 0x9e37)) * amp;
+        norm += amp;
+        amp *= 0.5;
+        freq *= 2.0;
+    }
+    sum / norm
+}
+
+impl AddNoise {
+    /// Noise for one pixel (16.16, about 4096 per standard deviation like
+    /// the Gaussian table) for the three colour channels.
+    fn sample(&self, x: i32, y: i32, table: &[i32], seeds: [u32; 3]) -> (i32, i32, i32) {
+        let size = self.size.max(1.0);
+        let (fx, fy) = ((x as f32 + 0.5) / size, (y as f32 + 0.5) / size);
+        let one = |s: u32| -> i32 {
+            match self.kind {
+                NoiseKind::Gaussian => {
+                    let h = hash3(fx.floor() as i32, fy.floor() as i32, s);
+                    table[(h & 0x3fff) as usize]
+                }
+                NoiseKind::Uniform => (lattice(fx.floor() as i32, fy.floor() as i32, s) * 7000.0) as i32,
+                NoiseKind::Perlin => (fractal(perlin, fx, fy, s, self.octaves) * 8192.0) as i32,
+                NoiseKind::Value => (fractal(value_noise, fx, fy, s, self.octaves) * 8192.0) as i32,
+                NoiseKind::Cellular => (cellular(fx, fy, s) * 8192.0) as i32,
+            }
+        };
+        (one(seeds[0]), one(seeds[1]), one(seeds[2]))
     }
 }
 
@@ -248,6 +374,17 @@ impl Effect for AddNoise {
         let mut c = slider_i(ui, "Intensity", &mut self.intensity, 0, 100);
         c |= slider_i(ui, "Color Saturation", &mut self.color_saturation, 0, 400);
         c |= slider_f(ui, "Coverage", &mut self.coverage, 0.0, 100.0);
+        ui.label("Type");
+        egui::ComboBox::from_id_salt("noise_kind").selected_text(self.kind.name()).show_ui(ui, |ui| {
+            for k in NoiseKind::ALL {
+                c |= ui.selectable_value(&mut self.kind, k, k.name()).changed();
+            }
+        });
+        ui.label("Size");
+        c |= ui.add(egui::Slider::new(&mut self.size, 1.0..=400.0).logarithmic(true).suffix(" px")).changed();
+        if self.kind.fractal() {
+            c |= slider_i(ui, "Detail (octaves)", &mut self.octaves, 1, 8);
+        }
         c |= seed(ui, &mut self.seed);
         c
     }
@@ -270,11 +407,14 @@ impl Effect for AddNoise {
                 if hash01(x, y, s1) as f64 > coverage {
                     continue;
                 }
-                let h2 = hash3(x, y, s2);
-                let h3 = hash3(x, y, s3);
-                let nr = table[(h2 & 0x3fff) as usize];
-                let ng = table[((h2 >> 14) & 0x3fff) as usize];
-                let nb = table[(h3 & 0x3fff) as usize];
+                let (nr, ng, nb) = if self.kind == NoiseKind::Gaussian && self.size <= 1.0 {
+                    // Pinta / Paint.NET grain, bit-exact
+                    let h2 = hash3(x, y, s2);
+                    let h3 = hash3(x, y, s3);
+                    (table[(h2 & 0x3fff) as usize], table[((h2 >> 14) & 0x3fff) as usize], table[(h3 & 0x3fff) as usize])
+                } else {
+                    self.sample(x, y, table, [s2, s3, s1 ^ 0x5bd1_e995])
+                };
                 let lum = (4899 * nr + 9618 * ng + 1867 * nb) >> 14;
                 let sat_ch = |n: i32| lum + (((n - lum) * sat) >> 12);
                 let a = p[3] as i32;
@@ -423,7 +563,10 @@ mod tests {
         for e in all() {
             check(e);
         }
-        check(Box::new(AddNoise { intensity: 100, color_saturation: 400, coverage: 37.5, seed: 1234 }));
+        check(Box::new(AddNoise { intensity: 100, color_saturation: 400, coverage: 37.5, seed: 1234, ..Default::default() }));
+        for kind in NoiseKind::ALL {
+            check(Box::new(AddNoise { kind, size: 23.0, octaves: 3, ..Default::default() }));
+        }
         check(Box::new(Median { radius: 3, percentile: 90 }));
         check(Box::new(Median { radius: 25, percentile: 0 }));
         check(Box::new(ReduceNoise { radius: 15, strength: 1.0 }));
