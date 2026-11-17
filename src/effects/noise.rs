@@ -418,12 +418,31 @@ impl Effect for AddNoise {
                 let lum = (4899 * nr + 9618 * ng + 1867 * nb) >> 14;
                 let sat_ch = |n: i32| lum + (((n - lum) * sat) >> 12);
                 let a = p[3] as i32;
+                let off = |n: i32| (n * dev + 32768) >> 16;
+                let (or, og, ob) = (off(sat_ch(nr)), off(sat_ch(ng)), off(sat_ch(nb)));
+                if a == 0 {
+                    // Empty pixel: paint light / dark specks whose opacity
+                    // follows the noise strength, so the layer works as a
+                    // noise overlay.
+                    let ol = (4899 * or + 9618 * og + 1867 * ob) >> 14;
+                    let na = (ol.abs() * 2).min(255);
+                    if na == 0 {
+                        continue;
+                    }
+                    let m = ol.abs().max(1);
+                    let col = |o: i32| (128 + o * 128 / m).clamp(0, 255);
+                    p[0] = (col(or) * na / 255) as u8;
+                    p[1] = (col(og) * na / 255) as u8;
+                    p[2] = (col(ob) * na / 255) as u8;
+                    p[3] = na as u8;
+                    continue;
+                }
                 // Pinta adds noise to the premultiplied channels; keep the
                 // result a valid premultiplied colour.
-                let add = |c: u8, n: i32| (c as i32 + ((n * dev + 32768) >> 16)).clamp(0, a) as u8;
-                p[0] = add(p[0], sat_ch(nr));
-                p[1] = add(p[1], sat_ch(ng));
-                p[2] = add(p[2], sat_ch(nb));
+                let add = |c: u8, o: i32| (c as i32 + o).clamp(0, a) as u8;
+                p[0] = add(p[0], or);
+                p[1] = add(p[1], og);
+                p[2] = add(p[2], ob);
             }
         }
     }

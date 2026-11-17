@@ -1,6 +1,6 @@
 [package]
 name = "patina"
-version = "0.1.9"
+version = "0.1.10"
 edition = "2024"
 description = "A fast, GPU-rendered image editor in Rust, ported from Pinta"
 license-file = "LICENSE"

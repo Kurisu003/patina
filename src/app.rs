@@ -1693,13 +1693,12 @@ impl App {
                 };
                 let selected = i == d.state.current;
                 let frame = egui::Frame::new().inner_margin(2.0).fill(if selected { ui.visuals().selection.bg_fill } else { Color32::TRANSPARENT }).corner_radius(3.0);
+                let mut check_rect = Rect::NOTHING;
                 let r = frame
                     .show(ui, |ui| {
                         ui.horizontal(|ui| {
                             let mut vis = !l.hidden;
-                            if ui.checkbox(&mut vis, "").on_hover_text("Visible").changed() {
-                                action = Some((i, 1));
-                            }
+                            check_rect = ui.checkbox(&mut vis, "").on_hover_text("Visible").rect.expand(2.0);
                             let sz = tex.size_vec2();
                             let s = 40.0 / sz.x.max(sz.y);
                             let (rr, _) = ui.allocate_exact_size(Vec2::splat(42.0), Sense::hover());
@@ -1711,11 +1710,13 @@ impl App {
                         })
                     })
                     .response;
+                // the row sits on top of the checkbox, so hit-test the checkbox here
                 let r = ui.interact(r.rect, ui.id().with(("layer", l.id)), Sense::click());
+                let on_check = r.interact_pointer_pos().is_some_and(|p| check_rect.contains(p));
                 if r.clicked() {
-                    action = Some((i, 0));
+                    action = Some((i, if on_check { 1 } else { 0 }));
                 }
-                if r.double_clicked() {
+                if r.double_clicked() && !on_check {
                     action = Some((i, 2));
                 }
             }
