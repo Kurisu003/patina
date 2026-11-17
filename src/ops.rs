@@ -330,6 +330,18 @@ pub fn move_layer(doc: &mut Document, up: bool) {
     }
 }
 
+/// Move layer `from` to stack position `to` (drag and drop in the Layers panel).
+pub fn move_layer_to(doc: &mut Document, from: usize, to: usize) {
+    let st = &mut doc.state;
+    if from == to || from >= st.layers.len() || to >= st.layers.len() {
+        return;
+    }
+    let l = st.layers.remove(from);
+    st.layers.insert(to, l);
+    st.current = to;
+    doc.commit(if to > from { "Move Layer Up" } else { "Move Layer Down" });
+}
+
 pub fn flip_layer(doc: &mut Document, horizontal: bool) {
     let (w, h) = (doc.state.width as i32, doc.state.height as i32);
     let l = doc.state.layer_mut();

@@ -50,7 +50,7 @@ enum Dialog {
     UpdateDone { version: String },
     /// A plain message box.
     Info { title: String, text: String },
-    Preferences { w: u32, h: u32, bg: u8, skin: Skin, keys: crate::tools::KeyBindings, attached: bool, check_updates: bool },
+    Preferences { w: u32, h: u32, bg: u8, skin: Skin, keys: crate::tools::KeyBindings, attached: bool, check_updates: bool, checker: [[u8; 3]; 2] },
     /// Clipboard image: paste into the current image or open as a new one.
     PasteChoice { w: u32, h: u32, data: Arc<Vec<u8>>, fit: ops::PasteFit },
     /// Files dropped onto the window while an image is open.
@@ -71,6 +71,8 @@ pub struct App {
     ants: HashMap<u64, AntsCache>,
     ants_counter: u64,
     thumbs: HashMap<u64, (usize, egui::TextureHandle)>,
+    /// Layer being dragged in the Layers panel (stack index).
+    layer_drag: Option<usize>,
     tools: Tools,
     palette: Palette,
     icons: HashMap<String, egui::TextureHandle>,
@@ -163,6 +165,39 @@ struct Prefs {
     windows_attached: bool,
     /// Look for a new release on startup.
     check_updates: bool,
+    /// Transparency checkerboard colours (light, dark squares).
+    checker: [[u8; 3]; 2],
+    /// Height of the layer list and width of the Paint.NET Layers window.
+    layers_h: f32,
+    layers_w: f32,
+}
+
+pub const DEFAULT_CHECKER: [[u8; 3]; 2] = [[255, 255, 255], [204, 204, 204]];
+
+/// Checkerboard colours in use, shared with the free `checker` painter.
+static CHECKER: [std::sync::atomic::AtomicU32; 2] = [std::sync::atomic::AtomicU32::new(0xffffff), std::sync::atomic::AtomicU32::new(0xcccccc)];
+
+fn set_checker(c: [[u8; 3]; 2]) {
+    for (slot, [r, g, b]) in CHECKER.iter().zip(c) {
+        slot.store(u32::from_be_bytes([0, r, g, b]), std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+fn checker_colors() -> [Color32; 2] {
+    CHECKER.each_ref().map(|a| {
+        let [_, r, g, b] = a.load(std::sync::atomic::Ordering::Relaxed).to_be_bytes();
+        Color32::from_rgb(r, g, b)
+    })
+}
+
+fn parse_hex_rgb(v: &str) -> Option<[u8; 3]> {
+    let v = v.trim().trim_start_matches('#');
+    if v.len() != 6 {
+        return None;
+    }
+    let n = u32::from_str_radix(v, 16).ok()?;
+    let [_, r, g, b] = n.to_be_bytes();
+    Some([r, g, b])
 }
 
 impl Prefs {
@@ -170,7 +205,7 @@ impl Prefs {
         std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config/patina/prefs"))
     }
     fn load() -> Prefs {
-        let mut p = Prefs { w: 800, h: 600, bg: 0, keys: Default::default(), windows_attached: false, check_updates: true };
+        let mut p = Prefs { w: 800, h: 600, bg: 0, keys: Default::default(), windows_attached: false, check_updates: true, checker: DEFAULT_CHECKER, layers_h: 160.0, layers_w: 340.0 };
         let text = Self::path().and_then(|f| std::fs::read_to_string(f).ok()).unwrap_or_default();
         for line in text.lines() {
             let Some((k, v)) = line.split_once('=') else { continue };
@@ -181,6 +216,10 @@ impl Prefs {
                 "canvas_background" => p.bg = v.parse().unwrap_or(p.bg).min(2),
                 "windows_attached" => p.windows_attached = v == "1" || v == "true",
                 "check_updates" => p.check_updates = v == "1" || v == "true",
+                "checker_light" => p.checker[0] = parse_hex_rgb(v).unwrap_or(p.checker[0]),
+                "checker_dark" => p.checker[1] = parse_hex_rgb(v).unwrap_or(p.checker[1]),
+                "layers_height" => p.layers_h = v.parse().unwrap_or(p.layers_h).clamp(40.0, 4000.0),
+                "layers_width" => p.layers_w = v.parse().unwrap_or(p.layers_w).clamp(340.0, 4000.0),
                 k => {
                     for (id, _, slot) in p.keys.entries() {
                         if id == k {
@@ -192,15 +231,19 @@ impl Prefs {
                 }
             }
         }
+        set_checker(p.checker);
         p
     }
     fn save(self) {
         if let Some(f) = Self::path() {
             let _ = std::fs::create_dir_all(f.parent().unwrap());
             let mut text = format!(
-                "canvas_width={}\ncanvas_height={}\ncanvas_background={}\nwindows_attached={}\ncheck_updates={}\n",
-                self.w, self.h, self.bg, self.windows_attached as u8, self.check_updates as u8
+                "canvas_width={}\ncanvas_height={}\ncanvas_background={}\nwindows_attached={}\ncheck_updates={}\nlayers_height={}\nlayers_width={}\n",
+                self.w, self.h, self.bg, self.windows_attached as u8, self.check_updates as u8, self.layers_h.round(), self.layers_w.round()
             );
+            for (k, [r, g, b]) in [("checker_light", self.checker[0]), ("checker_dark", self.checker[1])] {
+                text.push_str(&format!("{k}={r:02x}{g:02x}{b:02x}\n"));
+            }
             let mut keys = self.keys;
             for (id, _, m) in keys.entries() {
                 text.push_str(&format!("{id}={}\n", m.id()));
@@ -283,6 +326,7 @@ impl App {
             ants: HashMap::new(),
             ants_counter: 0,
             thumbs: HashMap::new(),
+            layer_drag: None,
             tools: Tools::default(),
             palette: Palette::default(),
             icons: load_icons(&cc.egui_ctx),
@@ -1158,7 +1202,7 @@ impl App {
                 ui.separator();
                 if ui.button("Preferences...").clicked() {
                     let p = self.prefs;
-                    self.dialog = Dialog::Preferences { w: p.w, h: p.h, bg: p.bg, skin: self.skin, keys: p.keys, attached: p.windows_attached, check_updates: p.check_updates };
+                    self.dialog = Dialog::Preferences { w: p.w, h: p.h, bg: p.bg, skin: self.skin, keys: p.keys, attached: p.windows_attached, check_updates: p.check_updates, checker: p.checker };
                 }
             });
             ui.menu_button("View", |ui| {
@@ -1674,10 +1718,56 @@ impl App {
 
     // ---- side panels -------------------------------------------------------------
 
+    /// Drag bar that sets the layer list height (and the Paint.NET window
+    /// width). `top`: the bar sits above the list (window anchored at the bottom).
+    fn layers_grip(&mut self, ui: &mut egui::Ui, top: bool) {
+        let classic = self.skin.is_classic();
+        let (r, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 9.0), Sense::drag());
+        let resp = resp.on_hover_text("Drag to resize the Layers panel");
+        let hot = resp.hovered() || resp.dragged();
+        if hot {
+            ui.ctx().set_cursor_icon(if classic { egui::CursorIcon::ResizeNwSe } else { egui::CursorIcon::ResizeVertical });
+        }
+        let col = if hot { ui.visuals().selection.bg_fill } else { ui.visuals().weak_text_color() };
+        for k in -1..=1 {
+            let y = r.center().y + k as f32 * 2.5;
+            ui.painter().line_segment([Pos2::new(r.center().x - 16.0, y), Pos2::new(r.center().x + 16.0, y)], egui::Stroke::new(1.0, col));
+        }
+        if resp.dragged() {
+            let d = resp.drag_delta();
+            let sign = if top { -1.0 } else { 1.0 };
+            self.prefs.layers_h = (self.prefs.layers_h + sign * d.y).clamp(40.0, 4000.0);
+            if classic {
+                self.prefs.layers_w = (self.prefs.layers_w + sign * d.x).clamp(340.0, 4000.0);
+            }
+        }
+        if resp.drag_stopped() {
+            self.prefs.save();
+        }
+    }
+
     fn layers_panel(&mut self, ui: &mut egui::Ui) {
+        let classic = self.skin.is_classic();
+        let grip_top = classic && self.prefs.windows_attached;
+        if classic {
+            ui.set_min_width(self.prefs.layers_w);
+        }
+        if grip_top {
+            self.layers_grip(ui, true);
+        }
+        // keep room for the buttons (and History below in the Pinta layout)
+        let room = if classic { ui.ctx().content_rect().height() - 200.0 } else { ui.available_height() - 120.0 };
+        let list_h = self.prefs.layers_h.min(room).max(40.0);
+        let busy = self.tools.is_busy();
+        let mut drag = self.layer_drag;
+        let mut drop_to: Option<(usize, usize)> = None;
         let Some(d) = self.docs.get_mut(self.active) else { return };
+        if drag.is_some_and(|f| f >= d.state.layers.len()) {
+            drag = None;
+        }
         let mut action: Option<(usize, u8)> = None;
-        egui::ScrollArea::vertical().id_salt("layers").max_height(ui.available_height() * 0.5).show(ui, |ui| {
+        egui::ScrollArea::vertical().id_salt("layers").auto_shrink([false, false]).max_height(list_h).min_scrolled_height(list_h).show(ui, |ui| {
+            let mut rows: Vec<(usize, Rect)> = Vec::new();
             for i in (0..d.state.layers.len()).rev() {
                 let l = &d.state.layers[i];
                 let key = Arc::as_ptr(&l.surface.tiles) as usize;
@@ -1692,7 +1782,14 @@ impl App {
                     }
                 };
                 let selected = i == d.state.current;
-                let frame = egui::Frame::new().inner_margin(2.0).fill(if selected { ui.visuals().selection.bg_fill } else { Color32::TRANSPARENT }).corner_radius(3.0);
+                let fill = if selected {
+                    ui.visuals().selection.bg_fill
+                } else if drag == Some(i) {
+                    ui.visuals().widgets.hovered.weak_bg_fill
+                } else {
+                    Color32::TRANSPARENT
+                };
+                let frame = egui::Frame::new().inner_margin(2.0).fill(fill).corner_radius(3.0);
                 let mut check_rect = Rect::NOTHING;
                 let r = frame
                     .show(ui, |ui| {
@@ -1711,8 +1808,12 @@ impl App {
                     })
                     .response;
                 // the row sits on top of the checkbox, so hit-test the checkbox here
-                let r = ui.interact(r.rect, ui.id().with(("layer", l.id)), Sense::click());
+                let r = ui.interact(r.rect, ui.id().with(("layer", l.id)), Sense::click_and_drag());
+                rows.push((i, r.rect));
                 let on_check = r.interact_pointer_pos().is_some_and(|p| check_rect.contains(p));
+                if r.drag_started() && !on_check && !busy {
+                    drag = Some(i);
+                }
                 if r.clicked() {
                     action = Some((i, if on_check { 1 } else { 0 }));
                 }
@@ -1720,7 +1821,46 @@ impl App {
                     action = Some((i, 2));
                 }
             }
+            // drag and drop reordering: rows are listed top layer first
+            if let Some(from) = drag {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+                let py = ui.ctx().pointer_latest_pos().map_or(f32::MAX, |p| p.y);
+                let mut pos = 0;
+                let mut line_y = rows.last().map_or(0.0, |r| r.1.bottom());
+                for &(i, rr) in &rows {
+                    if py < rr.center().y {
+                        pos = i + 1;
+                        line_y = rr.top();
+                        break;
+                    }
+                }
+                let to = if pos > from { pos - 1 } else { pos };
+                if to != from {
+                    let x = ui.clip_rect().x_range();
+                    let y = line_y.clamp(ui.clip_rect().top() + 1.0, ui.clip_rect().bottom() - 1.0);
+                    ui.painter().hline(x, y, egui::Stroke::new(2.0, ui.visuals().selection.bg_fill));
+                }
+                // scroll while dragging near the edges
+                let clip = ui.clip_rect();
+                if py < clip.top() + 14.0 {
+                    ui.scroll_with_delta(Vec2::new(0.0, 6.0));
+                } else if py > clip.bottom() - 14.0 && py != f32::MAX {
+                    ui.scroll_with_delta(Vec2::new(0.0, -6.0));
+                }
+                if !ui.input(|i| i.pointer.primary_down()) {
+                    drop_to = Some((from, to));
+                    drag = None;
+                }
+                ui.ctx().request_repaint();
+            }
         });
+        if let Some((from, to)) = drop_to {
+            ops::move_layer_to(d, from, to);
+        }
+        self.layer_drag = drag;
+        if !grip_top {
+            self.layers_grip(ui, false);
+        }
         ui.horizontal(|ui| {
             let d = &mut self.docs[self.active];
             let tint = ui.visuals().text_color();
@@ -1993,6 +2133,8 @@ impl App {
             checker: 8.0 * ppp,
             image: [w as f32, h as f32],
             _pad: [0.0; 2],
+            check_a: { let c = checker_colors()[0]; [c.r() as f32 / 255.0, c.g() as f32 / 255.0, c.b() as f32 / 255.0, 1.0] },
+            check_b: { let c = checker_colors()[1]; [c.r() as f32 / 255.0, c.g() as f32 / 255.0, c.b() as f32 / 255.0, 1.0] },
         };
         let frame = CanvasFrame { view, tiles, ants };
         painter.add(egui_wgpu::Callback::new_paint_callback(rect, CanvasCallback { frame: Arc::new(frame) }));
@@ -2133,7 +2275,7 @@ impl App {
                     }
                 });
             }
-            Dialog::Preferences { w, h, bg, skin, keys, attached, check_updates } => {
+            Dialog::Preferences { w, h, bg, skin, keys, attached, check_updates, checker } => {
                 egui::Window::new("Preferences").collapsible(false).resizable(false).anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO).order(egui::Order::Foreground).show(ctx, |ui| {
                     ui.strong("Appearance");
                     ui.horizontal(|ui| {
@@ -2143,6 +2285,20 @@ impl App {
                     });
                     ui.add_enabled_ui(skin.is_classic(), |ui| {
                         ui.checkbox(attached, "Windows attached").on_hover_text("Paint.NET skins: Tools top left, Colors bottom left, Layers bottom right, History top right");
+                    });
+                    ui.add_space(4.0);
+                    ui.label("Transparency checkerboard:");
+                    ui.horizontal(|ui| {
+                        let (pr, _) = ui.allocate_exact_size(Vec2::new(40.0, 20.0), Sense::hover());
+                        checker_with(ui.painter(), pr, checker.map(|[r, g, b]| Color32::from_rgb(r, g, b)));
+                        ui.painter().rect_stroke(pr, 0.0, ui.visuals().widgets.noninteractive.bg_stroke, egui::StrokeKind::Outside);
+                        egui::color_picker::color_edit_button_srgb(ui, &mut checker[0]).on_hover_text("Light squares");
+                        egui::color_picker::color_edit_button_srgb(ui, &mut checker[1]).on_hover_text("Dark squares");
+                        for (n, c) in [("Light", DEFAULT_CHECKER), ("Dark", [[68, 68, 68], [51, 51, 51]]), ("Black", [[24, 24, 24], [0, 0, 0]])] {
+                            if ui.small_button(n).clicked() {
+                                *checker = c;
+                            }
+                        }
                     });
                     ui.separator();
                     ui.strong("Default canvas");
@@ -2198,10 +2354,11 @@ impl App {
                             close = true;
                         }
                         if ui.add(egui::Button::new("Save").fill(ui.visuals().selection.bg_fill)).clicked() {
-                            let p = Prefs { w: *w, h: *h, bg: *bg, keys: *keys, windows_attached: *attached, check_updates: *check_updates };
+                            let p = Prefs { w: *w, h: *h, bg: *bg, keys: *keys, windows_attached: *attached, check_updates: *check_updates, checker: *checker, ..self.prefs };
                             let sk = *skin;
                             act = Some(Box::new(move |app: &mut App| {
                                 app.prefs = p;
+                                set_checker(p.checker);
                                 p.save();
                                 app.skin = sk;
                                 app.tools.keys = p.keys;
@@ -2738,7 +2895,7 @@ impl App {
         place(w, egui::Align2::RIGHT_TOP, area.right_top() + Vec2::new(-m, m), area.right_top() + Vec2::new(-210.0 - m, m)).open(&mut open).show(ctx, |ui| self.history_panel(ui));
         self.win_history = open;
         let mut open = self.win_layers;
-        let w = egui::Window::new("Layers").id(egui::Id::new("c_layers")).collapsible(false).default_size([230.0, 260.0]);
+        let w = egui::Window::new("Layers").id(egui::Id::new("c_layers")).collapsible(false).resizable(false);
         place(w, egui::Align2::RIGHT_BOTTOM, area.right_bottom() + Vec2::new(-m, -m), area.right_bottom() + Vec2::new(-240.0 - m, -300.0 - m)).open(&mut open).show(ctx, |ui| self.layers_panel(ui));
         self.win_layers = open;
         let mut open = self.win_colors;
@@ -2896,14 +3053,18 @@ impl App {
 }
 
 fn checker(p: &egui::Painter, r: Rect) {
-    p.rect_filled(r, 0.0, Color32::WHITE);
+    checker_with(p, r, checker_colors());
+}
+
+fn checker_with(p: &egui::Painter, r: Rect, [light, dark]: [Color32; 2]) {
+    p.rect_filled(r, 0.0, light);
     let s = 5.0;
     let mut y = r.min.y;
     let mut row = 0;
     while y < r.max.y {
         let mut x = r.min.x + if row % 2 == 1 { s } else { 0.0 };
         while x < r.max.x {
-            p.rect_filled(Rect::from_min_max(Pos2::new(x, y), Pos2::new((x + s).min(r.max.x), (y + s).min(r.max.y))), 0.0, Color32::from_gray(204));
+            p.rect_filled(Rect::from_min_max(Pos2::new(x, y), Pos2::new((x + s).min(r.max.x), (y + s).min(r.max.y))), 0.0, dark);
             x += 2.0 * s;
         }
         y += s;

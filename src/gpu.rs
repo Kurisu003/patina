@@ -18,6 +18,9 @@ pub struct ViewUniform {
     pub checker: f32,
     pub image: [f32; 2],
     pub _pad: [f32; 2],
+    /// Transparency checkerboard colours (sRGB 0..1, alpha unused).
+    pub check_a: [f32; 4],
+    pub check_b: [f32; 4],
 }
 
 #[repr(C)]

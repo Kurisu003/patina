@@ -53,6 +53,8 @@ Some timings on a 400 MP (20000 x 20000) image: brush stroke segment 0.2 ms, mag
   - Editable line/curve: drag points, click the line to add points, Enter to finish.
   - Brush hardness for the paintbrush, eraser and clone stamp.
   - Add Noise types (Gaussian grain, Uniform, Perlin, Value, Cellular) with adjustable size and detail.
+  - Layers panel: drag layers to reorder them, drag the grip to resize the panel.
+  - Custom transparency checkerboard colours (Edit > Preferences).
   - Click, then Shift+click with any brush to draw a straight line between the points (chainable, with preview).
   - Live magic wand: change the tolerance after clicking and the selection updates.
   - Move Selected with grab handles: drag handles or Shift+drag to resize,

@@ -9,6 +9,8 @@ struct View {
     checker: f32,    // checker square size in physical pixels
     image: vec2<f32>,
     _pad: vec2<f32>,
+    check_a: vec4<f32>,
+    check_b: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> view: View;
@@ -64,7 +66,7 @@ fn fs_tile(i: TileOut) -> @location(0) vec4<f32> {
     // checkerboard behind transparency, fixed in screen space like Pinta
     let p = floor(i.pos.xy / view.checker);
     let odd = (i32(p.x) + i32(p.y)) & 1;
-    let bg = select(vec3<f32>(1.0), vec3<f32>(0.8), odd == 1);
+    let bg = select(view.check_a.rgb, view.check_b.rgb, odd == 1);
     var rgb = c.rgb + bg * (1.0 - c.a);
     if ((view.flags & 2u) != 0u) {
         // pixel grid: darken pixels on the boundary of image pixels
