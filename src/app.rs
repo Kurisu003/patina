@@ -55,7 +55,7 @@ enum Dialog {
     PasteChoice { w: u32, h: u32, data: Arc<Vec<u8>>, fit: ops::PasteFit },
     /// Files dropped onto the window while an image is open.
     DropChoice { paths: Vec<PathBuf>, fit: ops::PasteFit },
-    NewImage { w: u32, h: u32, bg: u8 },
+    NewImage { w: u32, h: u32, bg: u8, clip: Option<(u32, u32)> },
     ResizeImage { pct: bool, percent: f32, w: u32, h: u32, keep: bool, mode: ops::Resample },
     CanvasSize { pct: bool, percent: f32, w: u32, h: u32, keep: bool, anchor: u8 },
     LayerProps { name: String, hidden: bool, opacity: f32, blend: crate::blend::BlendMode, orig: (String, bool, f32, crate::blend::BlendMode) },
@@ -595,6 +595,13 @@ impl App {
         }
     }
 
+    /// New Image dialog; suggests the size of a copied image like Pinta.
+    fn open_new_image(&mut self) {
+        let clip = self.clipboard.as_mut().and_then(|cb| cb.get_image().ok()).map(|i| (i.width as u32, i.height as u32)).filter(|&(w, h)| w > 0 && h > 0);
+        let (w, h) = clip.unwrap_or((self.prefs.w, self.prefs.h));
+        self.dialog = Dialog::NewImage { w, h, bg: self.prefs.bg, clip };
+    }
+
     fn paste(&mut self, target: u8) {
         let Some(cb) = self.clipboard.as_mut() else { return };
         let img = match cb.get_image() {
@@ -820,7 +827,7 @@ impl App {
         let cs = Modifiers::COMMAND | Modifiers::SHIFT;
         let ca = Modifiers::COMMAND | Modifiers::ALT;
         if sc(Modifiers::COMMAND, Key::N) {
-            self.dialog = Dialog::NewImage { w: self.prefs.w, h: self.prefs.h, bg: self.prefs.bg };
+            self.open_new_image();
         }
         if sc(Modifiers::COMMAND, Key::O) {
             self.open_dialog();
@@ -1119,7 +1126,7 @@ impl App {
         egui::MenuBar::new().ui(ui, |ui| {
             ui.menu_button("File", |ui| {
                 if ui.add(egui::Button::new("New…").shortcut_text("Ctrl+N")).clicked() {
-                    self.dialog = Dialog::NewImage { w: self.prefs.w, h: self.prefs.h, bg: self.prefs.bg };
+                    self.open_new_image();
                 }
                 if ui.add(egui::Button::new("Open…").shortcut_text("Ctrl+O")).clicked() {
                     self.open_dialog();
@@ -2368,8 +2375,20 @@ impl App {
                     });
                 });
             }
-            Dialog::NewImage { w, h, bg } => {
+            Dialog::NewImage { w, h, bg, clip } => {
+                let default = (self.prefs.w, self.prefs.h);
                 egui::Window::new("New Image").collapsible(false).resizable(false).anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO).order(egui::Order::Foreground).show(ctx, |ui| {
+                    if let Some((cw, ch)) = *clip {
+                        ui.horizontal(|ui| {
+                            if ui.selectable_label((*w, *h) == (cw, ch), format!("Copied image ({cw} x {ch})")).on_hover_text("Size of the image on the clipboard").clicked() {
+                                (*w, *h) = (cw, ch);
+                            }
+                            if ui.selectable_label((*w, *h) == default && default != (cw, ch), format!("Default ({} x {})", default.0, default.1)).on_hover_text("Default canvas from Edit > Preferences").clicked() {
+                                (*w, *h) = default;
+                            }
+                        });
+                        ui.add_space(4.0);
+                    }
                     egui::Grid::new("ni").num_columns(2).show(ui, |ui| {
                         ui.label("Width:");
                         ui.add(egui::DragValue::new(w).range(1..=100_000).suffix(" px"));
@@ -2833,7 +2852,7 @@ impl App {
             ui.horizontal(|ui| {
                 let b = |ui: &mut egui::Ui, t: &str, tip: &str| ui.add(egui::Button::new(t).small()).on_hover_text(tip).clicked();
                 if b(ui, "New", "New image (Ctrl+N)") {
-                    self.dialog = Dialog::NewImage { w: self.prefs.w, h: self.prefs.h, bg: self.prefs.bg };
+                    self.open_new_image();
                 }
                 if b(ui, "Open", "Open (Ctrl+O)") {
                     self.open_dialog();
